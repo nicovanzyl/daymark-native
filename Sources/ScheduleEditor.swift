@@ -177,7 +177,7 @@ struct ScheduleEditor: View {
         let disabled = back && named.isEmpty
         let action = setup ? (back ? "Finish setup" : "Next") : "Save schedule"
         return HStack(spacing: 8) {
-            Spacer(minLength: 0)
+            if setup { Spacer(minLength: 0) }
             Button { if back { changeStep(1) } else { close(false) } } label: {
                 Text(back ? "Back" : "Cancel").padding(.horizontal, 20).frame(height: 46)
             }
@@ -190,6 +190,7 @@ struct ScheduleEditor: View {
                 else { return .ignored }
                 return .handled
             }
+            if !setup { Spacer(minLength: 0) }
             Button(action: submit) {
                 HStack(spacing: 8) {
                     Text(action)

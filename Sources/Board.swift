@@ -1091,7 +1091,7 @@ struct Board: View {
             .font(.system(size: 16))
             .padding(.horizontal, gap).padding(.vertical, 4)
             .background(composerFocus ? palette.toolbarSelected : palette.raised, in: Capsule())
-            toolbarButton(.list, label: all ? "Return to focus" : "Show all tasks", selected: all, size: toolbarSize) {
+            toolbarButton(all ? .focus : .list, label: all ? "Return to focus" : "Show all tasks", selected: all, size: toolbarSize) {
                 if case .taskView = navigation {
                     cancelNavigation()
                 } else {
@@ -1111,37 +1111,53 @@ struct Board: View {
 
     private func toolbarButton(_ glyph: DaymarkToolbarGlyph, label: String, selected: Bool = false, size: CGFloat, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Canvas { context, size in
-                let color = glyph == .settings || selected ? palette.text : palette.muted
-                let sx = size.width / 24
-                let sy = size.height / 24
-                func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: x * sx, y: y * sy) }
-                func line(_ x1: CGFloat, _ y: CGFloat, _ x2: CGFloat) {
-                    var stroke = Path()
-                    stroke.move(to: pt(x1, y)); stroke.addLine(to: pt(x2, y))
-                    context.stroke(stroke, with: .color(color), style: StrokeStyle(lineWidth: 1.5 * sx, lineCap: .round))
-                }
-                func dot(_ x: CGFloat, _ y: CGFloat, _ r: CGFloat) -> Path {
-                    Path(ellipseIn: CGRect(x: (x-r)*sx, y: (y-r)*sy, width: 2*r*sx, height: 2*r*sy))
-                }
-                switch glyph {
-                case .list:
-                    for y in [CGFloat(6), 12, 18] {
-                        line(9, y, 20)
-                        context.fill(dot(4, y, 0.75), with: .color(color))
+            ZStack {
+                Canvas { context, size in
+                    let color = palette.text
+                    let sx = size.width / 24
+                    let sy = size.height / 24
+                    func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: x * sx, y: y * sy) }
+                    func line(_ x1: CGFloat, _ y: CGFloat, _ x2: CGFloat) {
+                        var stroke = Path()
+                        stroke.move(to: pt(x1, y)); stroke.addLine(to: pt(x2, y))
+                        context.stroke(stroke, with: .color(color), style: StrokeStyle(lineWidth: 1.5 * sx, lineCap: .round))
                     }
-                case .settings:
-                    line(4, 7, 20); line(4, 17, 20)
-                    for point in [(CGFloat(9), CGFloat(7)), (15, 17)] {
-                        let knob = dot(point.0, point.1, 3)
-                        context.fill(knob, with: .color(palette.raised))
-                        context.stroke(knob, with: .color(color), lineWidth: 1.5 * sx)
+                    func dot(_ x: CGFloat, _ y: CGFloat, _ r: CGFloat) -> Path {
+                        Path(ellipseIn: CGRect(x: (x-r)*sx, y: (y-r)*sy, width: 2*r*sx, height: 2*r*sy))
+                    }
+                    switch glyph {
+                    case .list:
+                        for y in [CGFloat(6), 12, 18] {
+                            line(9, y, 20)
+                            context.fill(dot(4, y, 0.75), with: .color(color))
+                        }
+                    case .focus:
+                        var corners = Path()
+                        for x in [CGFloat(4), 20] {
+                            for y in [CGFloat(5), 19] {
+                                corners.move(to: pt(x, y + (y == 5 ? 4 : -4)))
+                                corners.addLine(to: pt(x, y))
+                                corners.addLine(to: pt(x + (x == 4 ? 4 : -4), y))
+                            }
+                        }
+                        context.stroke(corners, with: .color(color), style: StrokeStyle(lineWidth: 1.5 * sx, lineCap: .round, lineJoin: .round))
+                        context.fill(dot(12, 12, 1.5), with: .color(color))
+                    case .settings:
+                        line(4, 7, 20); line(4, 17, 20)
+                        for point in [(CGFloat(9), CGFloat(7)), (15, 17)] {
+                            let knob = dot(point.0, point.1, 3)
+                            context.fill(knob, with: .color(palette.raised))
+                            context.stroke(knob, with: .color(color), lineWidth: 1.5 * sx)
+                        }
                     }
                 }
+                .id(glyph)
+                .transition(.opacity.combined(with: .scale(scale: 0.9)))
             }
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: glyph)
             .frame(width: 20, height: 20)
             .frame(width: size, height: size)
-            .background(selected ? palette.toolbarSelected : palette.raised, in: Circle())
+            .background(palette.raised, in: Circle())
         }
         .buttonStyle(ScheduleButtonStyle())
         .accessibilityLabel(label)
@@ -1151,7 +1167,7 @@ struct Board: View {
 
 }
 
-private enum DaymarkToolbarGlyph { case list, settings }
+private enum DaymarkToolbarGlyph { case list, focus, settings }
 
 private struct BoardControlFocusRing<Outline: InsettableShape>: ViewModifier {
     let shape: Outline
