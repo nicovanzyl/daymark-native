@@ -24,6 +24,8 @@ struct KeyboardTaskMove { let id: UUID; var destination: Stage }
 struct Workspace: Codable, Equatable {
     var settings = Settings()
     var tasks = [Task]()
+
+    var needsSetup: Bool { tasks.isEmpty && !settings.onboardingComplete }
 }
 
 @MainActor
@@ -64,7 +66,8 @@ final class WorkspaceStore: ObservableObject {
 
     func label(_ colour: Int) -> String {
         let index = min(max(0, colour), workspace.settings.labels.count - 1)
-        return workspace.settings.labels[index]
+        let name = workspace.settings.labels[index]
+        return name.isEmpty ? Schedule.defaults[index] : name
     }
 
     private func apply(_ change: (inout Workspace) -> Void) -> Bool {
@@ -74,7 +77,9 @@ final class WorkspaceStore: ObservableObject {
         do {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             try JSONEncoder().encode(next).write(to: url, options: [.atomic])
-            if workspace.settings != next.settings {
+            let current = workspace.settings
+            let updated = next.settings
+            if current.work != updated.work || current.shares != updated.shares || current.labels.count != updated.labels.count {
                 blocks = Schedule.buildWeek(next.settings.work, count: next.settings.labels.count, shares: next.settings.shares)
             }
             workspace = next
@@ -86,11 +91,29 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    func save(_ settings: Settings, coloursFrom original: [Int?]) -> Bool {
+    // Category edits take effect immediately. Work-hour edits have their own Save/Cancel boundary.
+    func updateCategories(labels: [String], shares: [Double], coloursFrom previous: [Int?]) -> Bool {
+        guard (1...6).contains(labels.count), previous.count == labels.count else { return false }
+        var settings = workspace.settings
+        settings.labels = labels
+        settings.shares = shares
+        if previous != workspace.settings.labels.indices.map(Optional.some) {
+            settings.work = settings.work.map { day in
+                day.map { window in
+                    var updated = window
+                    updated.allowed = Schedule.remapped(window.allowed, coloursFrom: previous)
+                    return updated
+                }
+            }
+        }
+        return save(settings, coloursFrom: previous, completeSetup: false)
+    }
+
+    func save(_ settings: Settings, coloursFrom original: [Int?], completeSetup: Bool = true) -> Bool {
         guard let work = Schedule.valid(settings.work, count: settings.labels.count) else { return false }
         var normalized = settings
         normalized.work = work
-        normalized.onboardingComplete = true
+        if completeSetup { normalized.onboardingComplete = true }
         return apply { next in
             next.settings = normalized
             next.tasks = next.tasks.map { old in

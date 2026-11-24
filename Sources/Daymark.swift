@@ -2,23 +2,88 @@ import AppKit
 import SwiftUI
 
 @MainActor
-final class DaymarkDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
-    let store = WorkspaceStore()
-    var status: NSStatusItem?
-    var window: NSWindow?
-    var timer: Timer?
+final class MenuBarStatus {
+    private enum Dot: Equatable {
+        case idle
+        case active(NSColor)
+    }
+
+    private var lastDot: Dot?
+
+    static func countdown(seconds: Int, locale: Locale = .autoupdatingCurrent) -> (title: String, spoken: String) {
+        let minutes = (seconds + 59) / 60
+        let remaining = Duration.seconds(minutes * 60)
+        return (
+            remaining.formatted(.units(allowed: [.hours, .minutes], width: .narrow).locale(locale)),
+            remaining.formatted(.units(allowed: [.hours, .minutes], width: .wide).locale(locale))
+        )
+    }
+
+    func update(_ button: NSStatusBarButton, store: WorkspaceStore, at date: Date) {
+        let configured = !store.workspace.needsSetup
+        let moment = configured ? Schedule.current(store.blocks, at: date) : nil
+        let indicator: Dot
+        if let moment {
+            let dark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            indicator = .active(NSColor(DaymarkPalette(dark: dark).block(moment.block.colour)))
+            let countdown = Self.countdown(seconds: moment.seconds)
+            let label = store.label(moment.block.colour)
+            button.title = countdown.title
+            button.imagePosition = .imageLeading
+            button.toolTip = "\(label) until \(Schedule.clock(moment.block.end))"
+            button.setAccessibilityValue("\(label), \(countdown.spoken) remaining")
+        } else {
+            indicator = .idle
+            button.title = ""
+            button.imagePosition = .imageOnly
+            button.toolTip = configured ? "No active focus block" : "Set up Daymark"
+            button.setAccessibilityValue(button.toolTip)
+        }
+
+        if indicator != lastDot {
+            let image = NSImage(size: NSSize(width: 14, height: 14), flipped: false) { bounds in
+                let dot = NSBezierPath(ovalIn: bounds.insetBy(dx: 2, dy: 2))
+                if case let .active(fill) = indicator {
+                    fill.setFill()
+                    dot.fill()
+                } else {
+                    NSColor.black.setStroke()
+                    dot.lineWidth = 1.5
+                    dot.stroke()
+                }
+                return true
+            }
+            image.isTemplate = indicator == .idle
+            button.image = image
+            lastDot = indicator
+        }
+    }
+}
+
+@MainActor
+final class DaymarkDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+    private let store = WorkspaceStore()
+    private let popover = NSPopover()
+    private let menuBarStatus = MenuBarStatus()
+    private var status: NSStatusItem?
+    private var initialPresentation: _Concurrency.Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        let menu = NSMenu()
-        let open = NSMenuItem(title: "Open Daymark", action: #selector(showBoard), keyEquivalent: "")
-        open.target = self
-        menu.addItem(open)
-        menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Quit Daymark", action: #selector(terminate), keyEquivalent: "q")
-        quit.target = self
-        menu.addItem(quit)
-        status?.menu = menu
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        status = item
+        if let button = item.button {
+            button.target = self
+            button.action = #selector(statusItemClicked(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            button.setAccessibilityLabel("Daymark")
+        }
+
+        let board = Board(store: store) { [weak self] in self?.popover.performClose(nil) }
+        let host = NSHostingController(rootView: board)
+        host.sizingOptions = []
+        popover.contentViewController = host
+        popover.behavior = .transient
+        popover.delegate = self
 
         let appMenu = NSMenu()
         let app = NSMenuItem()
@@ -40,46 +105,54 @@ final class DaymarkDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         updateStatus()
         let timer = Timer(timeInterval: 1, target: self, selector: #selector(updateStatus), userInfo: nil, repeats: true)
         RunLoop.main.add(timer, forMode: .common)
-        self.timer = timer
         // Help first launch discover the menu item; subsequent launches stay in the bar.
-        if !store.workspace.settings.onboardingComplete { showBoard() }
+        if store.workspace.needsSetup {
+            initialPresentation = _Concurrency.Task { @MainActor in
+                // A newly registered status item can have a zero-height window for its first layout passes.
+                for _ in 0..<60 {
+                    guard !_Concurrency.Task.isCancelled, store.workspace.needsSetup else { return }
+                    if let anchor = status?.button?.window, anchor.screen != nil, !anchor.frame.isEmpty {
+                        showBoard()
+                        if popover.isShown { return }
+                    }
+                    do { try await _Concurrency.Task.sleep(for: .milliseconds(75)) } catch { return }
+                }
+            }
+        }
     }
 
     @objc private func updateStatus() {
         guard let button = status?.button else { return }
-        let state = store.workspace.settings
-        if state.onboardingComplete, let moment = Schedule.current(store.blocks, at: .now) {
-            let label = store.label(moment.block.colour)
-            let minutes = (moment.seconds + 59) / 60
-            button.title = " \(String(label.prefix(17))) · \(minutes)m"
-            button.toolTip = "\(label) until \(Schedule.clock(moment.block.end))"
-        } else {
-            button.title = " Daymark"
-            button.toolTip = state.onboardingComplete ? "No active focus block" : "Set up Daymark"
-        }
-        button.image = NSImage(systemSymbolName: "clock", accessibilityDescription: "Daymark")
-        button.image?.isTemplate = true
-        button.imagePosition = .imageLeading
-        button.setAccessibilityLabel(button.toolTip ?? "Daymark")
+        menuBarStatus.update(button, store: store, at: .now)
     }
 
-    @objc private func showBoard() {
-        if window == nil {
-            let board = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 690),
-                                 styleMask: [.titled, .closable, .resizable, .miniaturizable],
-                                 backing: .buffered, defer: false)
-            board.title = "Daymark"
-            board.isReleasedWhenClosed = false
-            board.minSize = NSSize(width: 540, height: 460)
-            board.contentViewController = NSHostingController(rootView: Board(store: store))
-            board.setFrameAutosaveName("DaymarkNativeBoard")
-            if !board.setFrameUsingName("DaymarkNativeBoard") { board.center() }
-            board.delegate = self
-            window = board
+    @objc private func statusItemClicked(_ button: NSStatusBarButton) {
+        initialPresentation?.cancel()
+        let event = NSApp.currentEvent
+        if event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true {
+            popover.performClose(nil)
+            let menu = NSMenu()
+            let quit = menu.addItem(withTitle: "Quit Daymark", action: #selector(terminate), keyEquivalent: "q")
+            quit.target = self
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.minY), in: button)
+        } else if popover.isShown {
+            popover.performClose(nil)
+        } else {
+            showBoard()
         }
-        NSApp.activate(ignoringOtherApps: true)
-        window?.makeKeyAndOrderFront(nil)
     }
+
+    private func showBoard() {
+        guard let button = status?.button, let screen = button.window?.screen ?? NSScreen.main else { return }
+        let available = screen.visibleFrame.size
+        popover.contentSize = NSSize(width: min(520, available.width - 24),
+                                     height: min(580, available.height - 32))
+        NSApp.activate()
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popover.contentViewController?.view.window?.makeKey()
+    }
+
+    func popoverShouldDetach(_ popover: NSPopover) -> Bool { false }
 
     @objc private func terminate() { NSApp.terminate(nil) }
 }

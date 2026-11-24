@@ -1,46 +1,46 @@
 import SwiftUI
 
 struct ScheduleEditor: View {
-    private struct RangeDraft: Identifiable {
-        var id = UUID()
-        var start: Int
-        var end: Int
-        var allowed: Set<Int> = []
-    }
-    private struct FocusDraft: Identifiable {
-        var id = UUID()
-        var label: String
-        var weight: Double
-        var original: Int?
-    }
-    private struct SlotEdit {
-        let day: Int
-        var range: RangeDraft
-        var start: String
-        var end: String
-    }
-
     @ObservedObject var store: WorkspaceStore
     let palette: DaymarkPalette
     let setup: Bool
+    let exiting: Bool
+    let bottomInset: CGFloat
+    let onExitDurationChange: (Int) -> Void
     let close: (Bool) -> Void
     @State private var step = 1
+    @State private var nextStep: Int?
+    @AccessibilityFocusState private var headingFocused: Bool
+    private static let backTab = KeyEquivalent(Character("\u{19}"))
+    private enum Focus: Hashable { case panel, heading, label(UUID), back, submit }
+    @FocusState private var focus: Focus?
+    @State private var firstTrackFocusRequest = 0
+    @State private var appendedLabel: UUID?
+    @State private var frames: [Int: CGRect] = [:]
+    @State private var pageMotion = SchedulePageMotion(phase: .preparing)
+    @State private var viewport: CGSize = .zero
     @State private var work: [[RangeDraft]]
     @State private var blocks: [FocusDraft]
-    @State private var editing: SlotEdit?
-    @State private var removing: UUID?
+    @State private var nudgeHours = true
     @State private var error: String?
-    @FocusState private var focusedSlot: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    init(store: WorkspaceStore, palette: DaymarkPalette, setup: Bool, close: @escaping (Bool) -> Void) {
-        self.store = store; self.palette = palette; self.setup = setup; self.close = close
+    init(store: WorkspaceStore, palette: DaymarkPalette, setup: Bool, exiting: Bool,
+         bottomInset: CGFloat, onExitDurationChange: @escaping (Int) -> Void,
+         close: @escaping (Bool) -> Void) {
+        self.store = store; self.palette = palette; self.setup = setup; self.close = close; self.exiting = exiting
+        self.onExitDurationChange = onExitDurationChange
+        self.bottomInset = bottomInset
         let settings = store.workspace.settings
-        _work = State(initialValue: settings.work.map {
-            $0.map { RangeDraft(start: $0.start, end: $0.end, allowed: Set($0.allowed ?? [])) }
+        _work = State(initialValue: settings.work.map { day in
+            day.sorted { $0.start < $1.start }.map {
+                RangeDraft(start: $0.start, end: $0.end, allowed: Set($0.allowed ?? []))
+            }
         })
         let weights = Schedule.focusShares(settings.labels.count, settings.shares)
-        var drafts = settings.labels.enumerated().map {
-            FocusDraft(label: $0.element, weight: weights[$0.offset], original: $0.offset)
+        var drafts = settings.labels.enumerated().compactMap { index, label -> FocusDraft? in
+            if setup && label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return nil }
+            return FocusDraft(label: label, weight: weights[index], original: index)
         }
         if setup && drafts.count < 6 { drafts.append(FocusDraft(label: "", weight: 1, original: nil)) }
         _blocks = State(initialValue: drafts)
@@ -51,311 +51,389 @@ struct ScheduleEditor: View {
         Double(work.flatMap { $0 }.reduce(0) { $0 + $1.end - $1.start }) / 60
     }
 
+    private var title: String { step == 1 ? "Select the hours you normally work" : "What do you want to make time for?" }
+    private var leaving: Bool { exiting || nextStep != nil }
+    private var visibleItems: [Int] {
+        let bounds = CGRect(origin: .zero, size: viewport)
+        return frames.filter { !$0.value.intersection(bounds).isEmpty }.map(\.key).sorted()
+    }
+
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 8) {
-                if setup {
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack {
-                            Text(step == 1 ? "Select the hours you normally work" : "What do you want to make time for?")
-                                .font(.system(size: 16, weight: .medium))
-                            Spacer()
-                            Text("Step \(step) of 2").font(.system(size: 12)).foregroundStyle(palette.muted)
-                        }
-                        Text(step == 1 ? "Daymark splits these hours between your focus blocks." : "Add your projects or activities. Daymark shares your weekly hours into focus blocks for each.")
-                            .font(.system(size: 13)).foregroundStyle(palette.muted)
-                    }.padding(.top, 16).padding(.bottom, 20)
+        BoardPanel(palette: palette) {
+            editorContent
+                .background(alignment: .bottom) {
+                    LinearGradient(colors: [palette.raised, palette.page], startPoint: .top, endPoint: .bottom)
+                        .frame(height: bottomInset)
+                        .allowsHitTesting(false)
                 }
-                if setup && step == 2 { onboardingLabels }
-                if !setup { settingsLabels }
-                if !setup || step == 1 { tracks }
-                if let error = store.error ?? error { Text(error).font(.caption).foregroundStyle(palette.muted) }
-                HStack(spacing: 8) {
-                    Spacer()
-                    if setup && step == 2 {
-                        Button("Back") { error = nil; step = 1 }.buttonStyle(.plain)
-                    } else {
-                        Button("Cancel") { close(false) }.buttonStyle(.plain)
-                    }
-                    Button {
-                        submit()
-                    } label: {
-                        HStack(spacing: 8) {
-                            Text(setup ? (step == 1 ? "Next" : "Finish setup") : "Save schedule")
-                            if setup && step == 1 { Image(systemName: "arrow.right") }
-                        }
-                        .font(.system(size: 13, weight: .medium))
-                        .padding(.horizontal, 16).frame(height: 40)
-                        .foregroundStyle(palette.page)
-                        .background(palette.text, in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(editing != nil || (setup && step == 2 && named.isEmpty))
-                    .opacity(editing != nil || (setup && step == 2 && named.isEmpty) ? 0.45 : 1)
-                }.padding(.vertical, 16)
-            }
-            .padding(.horizontal, 16).frame(maxWidth: .infinity, alignment: .leading)
-        }.id(step)
-        .onExitCommand {
-            if editing != nil { editing = nil } else { close(false) }
+        } controls: {
+            actions
+                .disabled(leaving)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Schedule actions")
         }
+        .onExitCommand { close(false) }
+    }
+
+    private var editorContent: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                BoardScrollResolver().frame(height: 0).accessibilityHidden(true)
+                if setup { header }
+                VStack(alignment: .leading, spacing: 8) {
+                    if setup && step == 2 {
+                        onboardingLabels.padding(.vertical, 8).padding(.bottom, 16)
+                    } else {
+                        if !setup {
+                            FocusAllocation(blocks: Binding(get: { blocks }, set: updateBlocks),
+                                            work: modelWork, palette: palette, removeBlock: removeBlock)
+                                .padding(.bottom, 8)
+                                .modifier(ScheduleItemMotion(order: 0))
+                        }
+                        tracks
+                    }
+                }
+                .padding(.top, setup ? 8 : 0)
+                .padding(.bottom, 8)
+                if let error = store.error ?? error { Text(error).font(.caption).foregroundStyle(palette.muted) }
+            }
+            .padding([.horizontal, .top], 12)
+            .padding(.bottom, bottomInset)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .coordinateSpace(name: "schedule-viewport")
+        .background { GeometryReader { geo in
+            Color.clear.onChange(of: geo.size, initial: true) { _, size in viewport = size }
+        } }
+        .focusable(!setup).focusEffectDisabled().focused($focus, equals: .panel)
+        .accessibilityLabel(setup ? title : "Your schedule")
+        .id(step)
+        .environment(\.schedulePageMotion, pageMotion)
+        .onPreferenceChange(ScheduleItemFrames.self) { frames = $0 }
+        .onChange(of: visibleItems.count, initial: true) { _, count in
+            onExitDurationChange(BoardMotion.exitDuration(count: count))
+        }
+        .allowsHitTesting(!leaving)
+        .task(id: step) {
+            pageMotion = SchedulePageMotion(phase: .preparing)
+            // AppKit removes the previous step's first responder as the new scroll view mounts.
+            do { try await _Concurrency.Task.sleep(for: .milliseconds(16)) } catch { return }
+            guard !leaving else { return }
+            focus = setup ? .heading : .panel
+            headingFocused = setup
+            pageMotion = reduceMotion ? SchedulePageMotion() : SchedulePageMotion(phase: .entering, units: visibleItems)
+        }
+        .onChange(of: leaving) { _, leaving in
+            pageMotion = SchedulePageMotion(phase: leaving ? .exiting : .entering, units: visibleItems)
+        }
+        .task(id: nextStep) {
+            guard let destination = nextStep else { return }
+            if !reduceMotion {
+                let duration = BoardMotion.exitDuration(count: visibleItems.count)
+                do { try await _Concurrency.Task.sleep(for: .milliseconds(duration)) } catch { return }
+            }
+            appendedLabel = nil
+            nextStep = nil
+            step = destination
+        }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) { heading.fixedSize(); Spacer(minLength: 0); progress }
+                VStack(alignment: .leading, spacing: 0) { heading; progress }
+            }
+            Text(step == 1 ? "Daymark splits these hours between your focus blocks." : "Add your projects or activities. Daymark shares your weekly hours into focus blocks for each.")
+                .font(.system(size: 16)).foregroundStyle(palette.muted)
+                .lineSpacing(7).padding(.vertical, 3.5)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .focusable().focusEffectDisabled().focused($focus, equals: .heading)
+        .onKeyPress(keys: [.tab]) { press in
+            guard press.modifiers.isEmpty else { return .ignored }
+            if step == 1 { firstTrackFocusRequest += 1 }
+            else if let first = blocks.first { focus = .label(first.id) }
+            return .handled
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
+        .accessibilityFocused($headingFocused)
+        .modifier(ScheduleItemMotion(order: 0))
+    }
+
+    private var heading: some View {
+        Text(title).font(.system(size: 18)).frame(minHeight: 29, alignment: .leading)
+    }
+
+    private var progress: some View {
+        Text("Step \(step) of 2").font(.system(size: 16)).foregroundStyle(palette.muted).fixedSize()
+    }
+
+    private var actions: some View {
+        let back = setup && step == 2
+        let disabled = back && named.isEmpty
+        let action = setup ? (back ? "Finish setup" : "Next") : "Save schedule"
+        return HStack(spacing: 8) {
+            Spacer(minLength: 0)
+            Button { if back { changeStep(1) } else { close(false) } } label: {
+                Text(back ? "Back" : "Cancel").padding(.horizontal, 20).frame(height: 46)
+            }
+            .focusable().focused($focus, equals: .back)
+            .daymarkFocusRing(focus == .back, in: Capsule(), palette: palette)
+            .onKeyPress(keys: [.tab, Self.backTab]) { press in
+                guard back else { return .ignored }
+                if (press.key == Self.backTab || press.modifiers.contains(.shift)), let last = blocks.last { focus = .label(last.id) }
+                else if !disabled { focus = .submit }
+                else { return .ignored }
+                return .handled
+            }
+            Button(action: submit) {
+                HStack(spacing: 8) {
+                    Text(action)
+                    if setup && !back { Image(systemName: "arrow.right").frame(width: 16).accessibilityHidden(true) }
+                }
+                .padding(.horizontal, 20).frame(height: 46)
+                .foregroundStyle(disabled ? palette.muted : palette.page)
+                .background(disabled ? palette.raised : palette.text, in: Capsule())
+            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(disabled)
+            .focusable(!disabled).focused($focus, equals: .submit)
+            .daymarkFocusRing(focus == .submit && !disabled, in: Capsule(), palette: palette)
+            .onKeyPress(keys: [.tab, Self.backTab]) { press in
+                guard back && (press.key == Self.backTab || press.modifiers.contains(.shift)) else { return .ignored }
+                focus = .back
+                return .handled
+            }
+        }
+        .font(.system(size: 16)).buttonStyle(ScheduleButtonStyle())
     }
 
     private var onboardingLabels: some View {
-        VStack(spacing: 8) {
+        let colours = ["Red", "Amber", "Blue", "Green", "Purple", "Orange"]
+        let weights = Schedule.focusShares(named.count, named.map(\.weight))
+        return VStack(spacing: 8) {
             ForEach(Array(blocks.enumerated()), id: \.element.id) { index, item in
-                let weight = Schedule.focusShares(named.count, named.map(\.weight))
                 HStack(spacing: 8) {
                     Circle().fill(palette.block(index)).frame(width: 8, height: 8)
-                    TextField("e.g. " + Schedule.defaults[index], text: Binding(get: {
+                    TextField("Block name", text: Binding(get: {
                         blocks.first { $0.id == item.id }?.label ?? ""
-                    }, set: { renameSetup(item.id, to: $0) }))
+                    }, set: { renameSetup(item.id, to: $0) }),
+                              prompt: Text("e.g. " + Schedule.defaults[index]).foregroundStyle(palette.muted))
                     .textFieldStyle(.plain)
-                    .accessibilityLabel(Schedule.defaults[index] + " label")
+                    .focused($focus, equals: .label(item.id))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .onSubmit(submit)
+                    .onKeyPress(keys: [.tab, Self.backTab]) { press in
+                        guard press.modifiers.intersection([.command, .option, .control]).isEmpty else { return .ignored }
+                        let previous = press.key == Self.backTab || press.modifiers.contains(.shift)
+                        let next = index + (previous ? -1 : 1)
+                        if blocks.indices.contains(next) { focus = .label(blocks[next].id) }
+                        else { focus = next < 0 ? .heading : .back }
+                        return .handled
+                    }
+                    .accessibilityLabel(colours[index] + " label")
                     if let at = named.firstIndex(where: { $0.id == item.id }) {
-                        Text(hours(weeksHours * weight[at] / 100) + "h/week")
+                        Text(hours(weeksHours * weights[at] / 100) + "h/week")
                             .foregroundStyle(palette.muted)
                     }
                 }
-                .font(.system(size: 13))
+                .font(.system(size: 16))
                 .padding(.horizontal, 12).frame(height: 48)
                 .background(palette.page, in: Capsule())
+                .daymarkFocusRing(focus == .label(item.id), in: Capsule(), palette: palette)
+                .contentShape(Capsule())
+                .simultaneousGesture(TapGesture().onEnded { focus = .label(item.id) })
+                .modifier(ScheduleItemMotion(order: index + 1, appended: appendedLabel == item.id, focused: focus == .label(item.id)))
             }
         }
-    }
-
-    private var settingsLabels: some View {
-        let weights = Schedule.focusShares(blocks.count, blocks.map(\.weight))
-        let items = Schedule.buildWeek(modelWork, count: blocks.count, shares: weights)
-        return HStack(spacing: 8) {
-            ScrollView(.horizontal) {
-                HStack(spacing: 8) {
-                    ForEach(Array(blocks.enumerated()), id: \.element.id) { index, item in
-                        HStack(spacing: 8) {
-                            Circle().fill(palette.block(index)).frame(width: 8, height: 8)
-                            if removing == item.id { Text("Sure?").frame(maxWidth: .infinity, alignment: .leading) }
-                            else {
-                                TextField(Schedule.defaults[index], text: $blocks[index].label)
-                                    .textFieldStyle(.plain)
-                                    .accessibilityLabel("Focus block \(index + 1)")
-                                let h = Double(items.filter { $0.colour == index }.reduce(0) { $0 + $1.end - $1.start }) / 60
-                                Text(hours(weights[index]) + "%").foregroundStyle(palette.muted)
-                                    .help("Scheduled \(hours(h)) hours per week")
-                            }
-                            if blocks.count > 1 {
-                                Button {
-                                    if removing == item.id { removeBlock(index) }
-                                    else { removing = item.id }
-                                } label: {
-                                    Text(removing == item.id ? "✓" : "×").foregroundStyle(palette.muted)
-                                }.buttonStyle(.plain)
-                                    .accessibilityLabel((removing == item.id ? "Confirm remove " : "Remove ") + item.label)
-                            }
-                        }
-                        .padding(.horizontal, 12).frame(width: max(128, weights[index] * 4), height: 48)
-                        .background(palette.page, in: Capsule())
-                    }
-                }
-            }.scrollIndicators(.hidden)
-            if blocks.count < 6 {
-                Button {
-                    let oldCount = blocks.count
-                    for index in blocks.indices { blocks[index].weight = weights[index] * Double(oldCount) / Double(oldCount + 1) }
-                    let used = Set(blocks.map { $0.label.lowercased() })
-                    let label = Schedule.defaults.first { !used.contains($0.lowercased()) } ?? "New block"
-                    blocks.append(FocusDraft(label: label, weight: 100 / Double(oldCount + 1), original: nil))
-                } label: {
-                    Image(systemName: "plus").frame(width: 44, height: 44)
-                        .background(palette.page, in: Circle())
-                }.buttonStyle(.plain).accessibilityLabel("Add block label")
-            }
-        }.font(.system(size: 13))
     }
 
     private var tracks: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Color.clear.frame(width: 36, height: 12)
-                HStack {
-                    ForEach(0..<7, id: \.self) { index in
-                        if index > 0 { Spacer(minLength: 0) }
-                        Text(String(format: "%02d", index * 4))
-                    }
-                }.font(.system(size: 12)).monospacedDigit().padding(.horizontal, 2)
-            }
-            ForEach(0..<7, id: \.self) { day in
-                HStack(spacing: 8) {
-                    Text(Schedule.weekdays[day].prefix(3).uppercased()).font(.system(size: 12))
-                        .frame(width: 36, alignment: .leading)
-                        .accessibilityLabel(Schedule.weekdays[day])
-                    GeometryReader { geo in
-                        let width = max(0, geo.size.width - 4)
-                        ZStack(alignment: .leading) {
-                            Capsule().fill(palette.page)
-                                .contentShape(Rectangle())
-                                .onTapGesture(coordinateSpace: .local) { point in
-                                    guard editing == nil, width > 0 else { return }
-                                    insert(day, minute: Int(((point.x - 2) / width * 96).rounded()) * 15)
-                                }
-                            ForEach(work[day]) { range in
-                                let slotWidth = width * CGFloat(range.end - range.start) / 1440
-                                ZStack {
-                                    Button { openEditor(day, range) } label: {
-                                        Capsule().fill(palette.text.opacity(0.12)).frame(width: slotWidth, height: 32)
-                                    }.buttonStyle(.plain)
-                                        .accessibilityLabel("\(Schedule.weekdays[day]) \(Schedule.clock(range.start)) to \(Schedule.clock(range.end))")
-                                        .help("\(Schedule.clock(range.start))–\(Schedule.clock(range.end))")
-                                    if !setup && slotWidth >= CGFloat(blocks.count * 16 + 14) { dots(day, range, expanded: false) }
-                                }.offset(x: 2 + width * CGFloat(range.start) / 1440)
-                            }
-                        }
-                    }.frame(height: 36)
-                    .accessibilityAction(named: Text("Add hours on \(Schedule.weekdays[day])")) {
-                        insert(day, minute: 540)
-                    }
-                }.frame(height: 48)
-                if editing?.day == day { exactEditor.padding(.leading, 44) }
+            WorkHoursRuler()
+                .padding(.bottom, 8)
+                .modifier(ScheduleItemMotion(order: 1))
+            ForEach(Schedule.weekdays.indices, id: \.self) { day in
+                WorkHoursDay(day: day, ranges: $work[day], labels: displayLabels(blocks),
+                             palette: palette, setup: setup,
+                             focusTrackRequest: day == 0 ? firstTrackFocusRequest : 0,
+                             onNudgeEnd: { nudgeHours = false })
+                    .modifier(ScheduleItemMotion(order: day + 2))
             }
         }
+        .modifier(WorkHoursNudges(enabled: setup && nudgeHours, days: work.indices.filter { !work[$0].isEmpty }))
     }
 
-    private var exactEditor: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if let edit = editing {
-                HStack(spacing: 8) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Start")
-                        TextField("HH:MM", text: slotBinding(start: true))
-                            .focused($focusedSlot)
-                    }
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("End")
-                        TextField("HH:MM", text: slotBinding(start: false))
-                    }
-                    Button("Done", action: finishSlot).disabled(parsed(edit) == nil)
-                    Button("Remove", role: .destructive) {
-                        work[edit.day].removeAll { $0.id == edit.range.id }
-                        editing = nil
-                    }
-                }.textFieldStyle(.roundedBorder)
-                if !setup { dots(edit.day, edit.range, expanded: true) }
-                if parsed(edit) == nil { Text("Choose a free range in 15-minute steps.").foregroundStyle(palette.muted) }
-            }
-        }.font(.system(size: 12)).padding(.bottom, 8)
-            .onSubmit(finishSlot)
-    }
-
-    private func dots(_ day: Int, _ range: RangeDraft, expanded: Bool) -> some View {
-        let set = range.allowed.isEmpty ? Set(blocks.indices) : range.allowed
-        return HStack(spacing: expanded ? 8 : 0) {
-            ForEach(blocks.indices, id: \.self) { index in
-                let selected = set.contains(index)
-                Button {
-                    var updated = set
-                    if selected { updated.remove(index) } else { updated.insert(index) }
-                    if expanded { editing?.range.allowed = updated }
-                    else if let slot = work[day].firstIndex(where: { $0.id == range.id }) {
-                        work[day][slot].allowed = updated
-                    }
-                } label: {
-                    HStack(spacing: 4) {
-                        Circle().fill(palette.block(index)).frame(width: 8, height: 8)
-                            .scaleEffect(selected ? 1 : 0.5).opacity(selected ? 1 : 0.35)
-                        if expanded { Text(blocks[index].label) }
-                    }.frame(minWidth: 16, minHeight: 24).contentShape(Rectangle())
-                }.buttonStyle(.plain).disabled(selected && set.count == 1)
-                    .accessibilityLabel(blocks[index].label)
-                    .accessibilityAddTraits(selected ? .isSelected : [])
-            }
-        }
-    }
-
-    private func slotBinding(start: Bool) -> Binding<String> {
-        Binding(get: { (start ? editing?.start : editing?.end) ?? "" }, set: {
-            if start { editing?.start = $0 } else { editing?.end = $0 }
-        })
-    }
-
-    private func openEditor(_ day: Int, _ range: RangeDraft) {
-        editing = SlotEdit(day: day, range: range, start: Schedule.clock(range.start), end: Schedule.clock(range.end))
-        focusedSlot = true
-    }
-
-    private func insert(_ day: Int, minute: Int) {
-        let minute = min(1425, max(0, minute))
-        if work[day].contains(where: { $0.start <= minute && minute < $0.end }) { return }
-        let low = work[day].filter { $0.end <= minute }.map(\.end).max() ?? 0
-        let high = work[day].filter { $0.start > minute }.map(\.start).min() ?? 1440
-        guard high - low >= 15 else { return }
-        let start = max(low, min(minute, high - 60))
-        work[day].append(RangeDraft(start: start, end: min(high, start + 60)))
-        work[day].sort { $0.start < $1.start }
-    }
-
-    private func parsed(_ edit: SlotEdit) -> RangeDraft? {
-        guard let start = Schedule.minute(edit.start), var end = Schedule.minute(edit.end) else { return nil }
-        if end == 0 { end = 1440 }
-        guard start < end, start % 15 == 0, end % 15 == 0,
-              !work[edit.day].contains(where: { $0.id != edit.range.id && $0.start < end && start < $0.end }) else { return nil }
-        var range = edit.range
-        range.start = start; range.end = end
-        return range
-    }
-
-    private func finishSlot() {
-        guard let edit = editing, let range = parsed(edit),
-              let index = work[edit.day].firstIndex(where: { $0.id == range.id }) else { return }
-        if range.end - range.start == 15 && edit.range.end - edit.range.start > 15 {
-            work[edit.day].remove(at: index)
-        } else {
-            work[edit.day][index] = range
-            work[edit.day].sort { $0.start < $1.start }
-        }
-        editing = nil
+    private func changeStep(_ next: Int) {
+        error = nil
+        nextStep = next
     }
 
     private func renameSetup(_ id: UUID, to value: String) {
         guard let index = blocks.firstIndex(where: { $0.id == id }) else { return }
+        let label = String(value.prefix(48))
+        guard blocks[index].label != label else { return }
         let wasNamed = !blocks[index].label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        blocks[index].label = String(value.prefix(48))
-        let isNamed = !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        blocks[index].label = label
+        let isNamed = !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if wasNamed != isNamed { for at in blocks.indices { blocks[at].weight = 1 } }
-        blocks.removeAll { $0.id != id && $0.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        // Keep the same empty control while the preceding field is typed or loses focus.
+        let emptyToKeep = isNamed ? blocks.last?.id : id
+        blocks.removeAll { $0.id != emptyToKeep && $0.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         if blocks.count < 6 && blocks.allSatisfy({ !$0.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
-            blocks.append(FocusDraft(label: "", weight: 1, original: nil))
+            let row = FocusDraft(label: "", weight: 1, original: nil)
+            appendedLabel = row.id
+            blocks.append(row)
         }
     }
 
     private func removeBlock(_ index: Int) {
-        removing = nil
-        blocks.remove(at: index)
-        for day in work.indices {
-            for slot in work[day].indices {
-                work[day][slot].allowed = Set(work[day][slot].allowed.compactMap { $0 == index ? nil : ($0 > index ? $0 - 1 : $0) })
+        var remaining = blocks
+        remaining.remove(at: index)
+        updateBlocks(remaining)
+    }
+
+    private func displayLabels(_ values: [FocusDraft]) -> [String] {
+        values.enumerated().map { index, item in
+            let label = String(item.label.trimmingCharacters(in: .whitespacesAndNewlines).prefix(48))
+            return label.isEmpty ? Schedule.defaults[index] : label
+        }
+    }
+
+    private func updateBlocks(_ next: [FocusDraft]) {
+        let previous = next.map { item in blocks.firstIndex { $0.id == item.id } }
+        let weights = Schedule.focusShares(next.count, next.map(\.weight))
+        guard store.updateCategories(labels: displayLabels(next), shares: weights, coloursFrom: previous) else { return }
+        if blocks.count != next.count {
+            for day in work.indices {
+                for slot in work[day].indices {
+                    let allowed = Array(work[day][slot].allowed)
+                    work[day][slot].allowed = Set(Schedule.remapped(allowed, coloursFrom: previous) ?? [])
+                }
             }
         }
+        blocks = next
     }
 
     private var modelWork: [[WorkWindow]] {
         work.map { $0.map { WorkWindow(start: $0.start, end: $0.end,
-            allowed: setup || $0.allowed.isEmpty ? nil : $0.allowed.sorted()) } }
+            allowed: $0.allowed.isEmpty ? nil : $0.allowed.sorted()) } }
     }
 
-    private func hours(_ value: Double) -> String { String(format: value.rounded() == value ? "%.0f" : "%.1f", value) }
+    private func hours(_ value: Double) -> String {
+        let rounded = (value * 10).rounded() / 10
+        return String(format: rounded.rounded() == rounded ? "%.0f" : "%.1f", rounded)
+    }
 
     private func submit() {
-        guard editing == nil, let normalized = Schedule.valid(modelWork, count: max(1, setup ? named.count : blocks.count)) else {
+        guard !leaving else { return }
+        let count = setup && step == 2 ? named.count : store.workspace.settings.labels.count
+        guard let normalized = Schedule.valid(modelWork, count: max(1, count)) else {
             error = "Work hours must end after they start and must not overlap."; return
         }
-        if setup && step == 1 { error = nil; step = 2; return }
+        if setup && step == 1 {
+            if normalized != modelWork {
+                work = normalized.map { day in
+                    day.map { RangeDraft(start: $0.start, end: $0.end, allowed: Set($0.allowed ?? [])) }
+                }
+            }
+            changeStep(2)
+            return
+        }
         let result = setup ? named : blocks
         guard !result.isEmpty else { return }
-        let labels = result.enumerated().map { index, item in
-            let label = String(item.label.trimmingCharacters(in: .whitespacesAndNewlines).prefix(48))
-            return label.isEmpty ? Schedule.defaults[index] : label
-        }
+        let labels = displayLabels(result)
         let next = Settings(labels: labels, shares: Schedule.focusShares(result.count, result.map(\.weight)), work: normalized, onboardingComplete: true)
-        if store.save(next, coloursFrom: result.map(\.original)) { close(true) }
+        let previous = setup ? result.map(\.original) : result.indices.map(Optional.some)
+        if store.save(next, coloursFrom: previous) { close(true) }
+    }
+}
+
+
+private struct ScheduleItemFrames: PreferenceKey {
+    static let defaultValue: [Int: CGRect] = [:]
+    static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
+private struct SchedulePageMotion: Equatable {
+    var phase: BoardMotion.Phase = .resting
+    var units: [Int] = []
+}
+
+private struct ScheduleMotionKey: EnvironmentKey {
+    static let defaultValue = SchedulePageMotion()
+}
+
+private extension EnvironmentValues {
+    var schedulePageMotion: SchedulePageMotion {
+        get { self[ScheduleMotionKey.self] }
+        set { self[ScheduleMotionKey.self] = newValue }
+    }
+}
+
+private struct ScheduleItemMotion: ViewModifier {
+    let order: Int
+    var appended = false
+    var focused = false
+    @Environment(\.schedulePageMotion) private var motion
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var revealed = false
+
+    func body(content: Content) -> some View {
+        let index = motion.units.firstIndex(of: order)
+        let exiting = motion.phase == .exiting && index != nil
+        let hidden = exiting || motion.phase == .preparing || (appended && !revealed)
+        let revealImmediately = reduceMotion || (focused && !exiting)
+        let pageAnimation = index.flatMap { BoardMotion.animation(for: motion.phase, index: $0, count: motion.units.count) }
+        content
+            .modifier(ScheduleAppearance(opacity: hidden ? 0 : 1, offset: hidden ? (exiting ? -4 : 8) : 0,
+                                         revealImmediately: revealImmediately))
+            .animation(revealImmediately ? nil : pageAnimation, value: motion)
+            .animation(revealImmediately ? nil : BoardMotion.animation(for: .entering, index: 0, count: 1), value: revealed)
+            .background { GeometryReader { geo in
+                Color.clear.preference(key: ScheduleItemFrames.self, value: [order: geo.frame(in: .named("schedule-viewport"))])
+            } }
+            .task(id: appended) {
+                guard appended else { return }
+                do { try await _Concurrency.Task.sleep(for: .milliseconds(16)) } catch { return }
+                revealed = true
+            }
+    }
+}
+
+// Keyboard focus must expose the field even while its entrance is interpolating.
+private struct ScheduleAppearance: AnimatableModifier {
+    var opacity: Double
+    var offset: CGFloat
+    let revealImmediately: Bool
+
+    var animatableData: AnimatablePair<Double, CGFloat> {
+        get { AnimatablePair(opacity, offset) }
+        set { opacity = newValue.first; offset = newValue.second }
+    }
+
+    func body(content: Content) -> some View {
+        content.opacity(revealImmediately ? 1 : opacity)
+            .offset(y: revealImmediately ? 0 : offset)
+            .blur(radius: revealImmediately ? 0 : 4 * (1 - opacity))
+    }
+}
+
+struct ScheduleButtonStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .contentShape(Rectangle())
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.96 : 1)
+            .opacity(configuration.isPressed ? 0.85 : 1)
+            .animation(reduceMotion ? nil : .timingCurve(0.25, 1, 0.5, 1, duration: 0.12),
+                       value: configuration.isPressed)
     }
 }

@@ -26,18 +26,5 @@
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
-	<key>UTExportedTypeDeclarations</key>
-	<array>
-		<dict>
-			<key>UTTypeConformsTo</key>
-			<array>
-				<string>public.data</string>
-			</array>
-			<key>UTTypeDescription</key>
-			<string>Daymark Task (local drag)</string>
-			<key>UTTypeIdentifier</key>
-			<string>com.nicovanzyl.daymark.task</string>
-		</dict>
-	</array>
 </dict>
 </plist>

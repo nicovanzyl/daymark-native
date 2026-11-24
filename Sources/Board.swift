@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import UniformTypeIdentifiers
 
 struct DaymarkPalette {
     var dark: Bool
@@ -12,6 +11,7 @@ struct DaymarkPalette {
     var text: Color { rgb(dark ? 0xFFFFFF : 0x000000) }
     var muted: Color { rgb(dark ? 0x969CA8 : 0x686868) }
     var border: Color { rgb(dark ? 0x333333 : 0xD7D7D7) }
+    var focusRing: Color { rgb(dark ? 0x909090 : 0x707070) }
     var toolbarSelected: Color { rgb(dark ? 0x242424 : 0xD2D2D2) }
     var nowTask: Color { rgb(dark ? 0x202020 : 0xD8D8D8) }
     var taskCheckboxBorder: Color { rgb(dark ? 0x252525 : 0xD6D6D6) }
@@ -30,14 +30,48 @@ struct DaymarkPalette {
     }
 }
 
+extension View {
+    func daymarkFocusRing<S: InsettableShape>(_ focused: Bool, in shape: S, palette: DaymarkPalette) -> some View {
+        focusEffectDisabled()
+            .overlay {
+                if focused {
+                    shape.strokeBorder(palette.focusRing, lineWidth: 2)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+            }
+    }
+}
+
+struct BoardPanel<Content: View, Controls: View>: View {
+    let palette: DaymarkPalette
+    @ViewBuilder let content: () -> Content
+    @ViewBuilder let controls: () -> Controls
+
+    var body: some View {
+        VStack(spacing: 20) {
+            content()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(palette.raised, in: RoundedRectangle(cornerRadius: 24))
+                .clipShape(RoundedRectangle(cornerRadius: 24))
+                .accessibilityElement(children: .contain)
+            controls().frame(height: 48)
+        }
+    }
+}
+
 struct Board: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject var store: WorkspaceStore
     @Environment(\.colorScheme) private var scheme
+    @FocusState private var boardFocus: Bool
+    @State private var hasOpenedBoard = false
     @FocusState private var composerFocus: Bool
     @FocusState private var settingsFocus: Bool
     @State private var selected: Date?
-    @State private var dateAnchor: CGFloat?
     @State private var hoveredDate: Date?
+    @State private var tabPlacement: DateTabPlacement?
+    @State private var requestedTab: DateTabPlacement?
     @State private var hoveredHour: Int?
     @FocusState private var focusedDate: Date?
     @FocusState private var focusedLaneBlock: Int?
@@ -45,36 +79,114 @@ struct Board: View {
     @State private var preview: Int?
     @State private var all = false
     @State private var settingsOpen: Bool
-    @State private var settingsIdentity = UUID()
+    @State private var setupMode: Bool
+    @State private var editorExitDuration = 0
+    private enum BoardNavigation: Equatable {
+        case open, close(focusComposer: Bool), day(Date?), taskView(Bool), category(Int)
+
+        var tasksOnly: Bool {
+            if case .category = self { return true }
+            return false
+        }
+    }
+    @State private var navigation: BoardNavigation?
+    @State private var displayedColour: Int?
+    @State private var motion = BoardMotion()
     @State private var draft = ""
     @State private var taskColour: Int?
     @State private var taskStage: Stage?
-    @State private var composerMenu: ComposerMenu?
     @State private var keyboardMove: KeyboardTaskMove?
     @FocusState private var focusedTask: UUID?
+    @FocusState private var focusedCheckbox: UUID?
     @State private var feedback: String?
     @State private var editingID: UUID?
     @State private var deleteTask: Task?
-    @State private var dropTarget: Stage?
+    @State private var pointerMove: TaskPointerMove?
+    @State private var cancelledPointerMove = false
+    @State private var boardFrames: [BoardElement: CGRect] = [:]
+    private var taskViewport: CGRect { boardFrames[.viewport] ?? .zero }
+    @State private var settleFrames: [BoardElement: CGRect] = [:]
+    @State private var settling = false
+    @State private var settleGeneration = 0
     @State private var headerPositions: [String: CGFloat] = [:]
     @State private var scrollOffset: CGFloat = 0
     @State private var savedScrollOffset: CGFloat = 0
     @State private var scrollHost = WeakBoardScrollView()
-    private var needsSetup: Bool { store.workspace.tasks.isEmpty && !store.workspace.settings.onboardingComplete }
     var palette: DaymarkPalette { DaymarkPalette(dark: scheme == .dark) }
 
-    init(store: WorkspaceStore) {
+    private let onDismiss: () -> Void
+
+    init(store: WorkspaceStore, onDismiss: @escaping () -> Void) {
+        self.onDismiss = onDismiss
         self.store = store
-        _settingsOpen = State(initialValue: store.workspace.tasks.isEmpty && !store.workspace.settings.onboardingComplete)
+        let setup = store.workspace.needsSetup
+        _settingsOpen = State(initialValue: setup)
+        _setupMode = State(initialValue: setup)
     }
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { tick in
-            content(at: tick.date)
+            taskDragSurface(content(at: tick.date))
         }
         .background(palette.page)
         .foregroundStyle(palette.text)
         .font(.system(size: 16))
+        .task(id: navigation) {
+            guard let destination = navigation else { return }
+            if !reduceMotion {
+                let units = BoardMotion.visible(in: boardFrames, tasksOnly: destination.tasksOnly)
+                motion = BoardMotion(phase: .exiting, tasksOnly: destination.tasksOnly, units: units)
+                let duration = settingsOpen ? editorExitDuration : BoardMotion.exitDuration(count: units.count)
+                if duration > 0 {
+                    do { try await _Concurrency.Task.sleep(for: .milliseconds(duration)) } catch { return }
+                }
+            }
+            guard !_Concurrency.Task.isCancelled, navigation == destination else { return }
+            switch destination {
+            case .open:
+                settingsOpen = true
+            case let .close(focusComposer):
+                hasOpenedBoard = true
+                displayedColour = nil
+                settingsOpen = false
+                DispatchQueue.main.async {
+                    if focusComposer { composerFocus = true } else { settingsFocus = true }
+                }
+            case let .day(day):
+                selected = day
+                all = false
+                displayedColour = nil
+                settingsOpen = false
+                savedScrollOffset = 0
+                scrollOffset = 0
+                resetTaskFilter()
+            case let .taskView(showAll):
+                if !settingsOpen { savedScrollOffset = scrollOffset }
+                settingsOpen = false
+                all = showAll
+                displayedColour = nil
+                resetTaskFilter()
+            case let .category(colour):
+                displayedColour = colour
+                keyboardMove = nil
+                feedback = nil
+            }
+            navigation = nil
+            motion = settingsOpen || reduceMotion ? BoardMotion() : BoardMotion(phase: .preparing, tasksOnly: destination.tasksOnly)
+        }
+        .task(id: motion.phase) {
+            switch motion.phase {
+            case .preparing:
+                // Read the incoming geometry after SwiftUI has laid out the new cards.
+                do { try await _Concurrency.Task.sleep(for: .milliseconds(16)) } catch { return }
+                motion.units = BoardMotion.visible(in: boardFrames, tasksOnly: motion.tasksOnly)
+                motion.phase = .entering
+            case .entering:
+                do { try await _Concurrency.Task.sleep(for: .milliseconds(625)) } catch { return }
+                motion = BoardMotion()
+            default: break
+            }
+        }
         .confirmationDialog("Delete this task?", isPresented: Binding(get: { deleteTask != nil }, set: {
             if !$0 { deleteTask = nil }
         }), titleVisibility: .visible, presenting: deleteTask) { task in
@@ -87,74 +199,136 @@ struct Board: View {
         let active = selected ?? today
         let dayBlocks = store.blocks.filter { $0.day == Schedule.day(active) }
         let minute = Schedule.seconds(now) / 60
-        let activeColour = (dayBlocks.first { $0.start <= minute && $0.end > minute }
-                            ?? dayBlocks.first { $0.start > minute })?.colour ?? 0
+        let activeColour = dayBlocks.first(where: { $0.end > minute })?.colour ?? 0
         let activeMoment = Schedule.current(store.blocks, at: now)?.block
         let focusKey = "\(Schedule.dateKey(today)):\(Schedule.dateKey(active)):\(activeMoment?.id ?? -1):\(activeColour)"
         let selectedColour = pinned.flatMap { colour in dayBlocks.contains { $0.colour == colour } ? colour : nil }
         let chosen = selectedColour ?? preview ?? activeColour
-        let visible = store.visible(on: Schedule.dateKey(active), today: Schedule.dateKey(today), colour: all ? nil : chosen)
+        let visible = store.visible(on: Schedule.dateKey(active), today: Schedule.dateKey(today), colour: all ? nil : displayedColour ?? chosen)
         return GeometryReader { geometry in
             let width = geometry.size.width
-            let gutter = width <= 380 ? 8 : 24 + max(0, width / 2 - 24).truncatingRemainder(dividingBy: 32)
+            let gutter: CGFloat = width <= 380 ? 8 : 16
+            let fade = min(192, geometry.size.height * 0.24)
             VStack(spacing: 0) {
-                VStack(spacing: 0) {
-                    dateStrip(active, today: today, width: max(0, width - 2 * gutter))
-                        .opacity(settingsOpen ? 0 : 1)
-                        .disabled(settingsOpen)
-                        .accessibilityHidden(settingsOpen)
-                    Group {
-                        if settingsOpen {
-                            let setup = needsSetup
-                            ScheduleEditor(store: store, palette: palette, setup: setup) { saved in
-                                closeSettings(focusComposer: setup && saved)
-                            }
-                            .id(settingsIdentity)
-                        } else {
-                            dayViewport(
-                                blocks: dayBlocks, visible: visible, now: now, active: active, today: today,
-                                wide: width > 760, inset: width <= 640 ? 12 : 16,
-                                fade: min(192, geometry.size.height * 0.24))
-                        }
+                if settingsOpen {
+                    ScheduleEditor(store: store, palette: palette, setup: setupMode, exiting: navigation != nil, bottomInset: fade,
+                                   onExitDurationChange: { editorExitDuration = $0 }) { saved in
+                        closeSettings(focusComposer: setupMode && saved)
                     }
-                    .frame(maxHeight: .infinity)
-                    .background(palette.raised, in: RoundedRectangle(cornerRadius: 24))
-                    .clipShape(RoundedRectangle(cornerRadius: 24))
-                    .accessibilityElement(children: .contain)
+                } else {
+                    dateStrip(active, today: today, width: max(0, width - 2 * gutter))
+                        .opacity(navigation == .open ? 0 : 1)
+                        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: navigation == .open)
+                        .disabled(navigation == .open)
+                    BoardPanel(palette: palette) {
+                        dayViewport(blocks: dayBlocks, visible: visible, now: now, active: active, today: today,
+                                    wide: width > 760, inset: width <= 640 ? 12 : 16, fade: fade)
+                            .environment(\.boardMotion, motion)
+                    } controls: {
+                        composer(activeColour, compact: width <= 380)
+                    }
                 }
-                .padding(.horizontal, gutter)
-                composer(activeColour)
-                    .padding(.horizontal, 16)
-                    .padding(.top, 20)
             }
-            .padding(.vertical, 24)
+            .padding(.horizontal, gutter)
+            .padding(.top, 16)
+            .padding(.bottom, 24)
         }
-        .onChange(of: focusKey) { _, _ in all = false; preview = nil; keyboardMove = nil }
+        .onChange(of: chosen, initial: true) { _, requested in requestCategory(requested) }
+        .onChange(of: displayedColour == nil) { _, unselected in
+            if unselected { displayedColour = chosen }
+        }
+        .onChange(of: all) { _, showingAll in
+            if !showingAll { requestCategory(chosen) }
+        }
+        .onChange(of: pinned) { _, colour in
+            if let colour {
+                let count = store.visible(on: Schedule.dateKey(active), today: Schedule.dateKey(today), colour: colour).count
+                AccessibilityNotification.Announcement("\(store.label(colour)), \(count) \(count == 1 ? "task" : "tasks")").post()
+            }
+        }
+        .onChange(of: focusKey) { _, _ in
+            all = false
+            preview = nil
+            keyboardMove = nil
+        }
         .onChange(of: focusedTask) { _, focused in
+            if let task = store.workspace.tasks.first(where: { $0.id == focused }), pointerMove == nil {
+                revealFocusedTask(task)
+            }
             if keyboardMove?.id != focused { keyboardMove = nil }
         }
-        .onChange(of: editingID) { _, id in if id != nil { preview = nil } }
-        .onExitCommand {
-            if settingsOpen { closeSettings() }
+        .onChange(of: focusedCheckbox) { _, id in
+            if let task = store.workspace.tasks.first(where: { $0.id == id }) { revealFocusedTask(task) }
+        }
+        .onChange(of: keyboardMove?.destination) { _, stage in
+            if let stage, let id = keyboardMove?.id {
+                AccessibilityNotification.Announcement(destinationHint(stage, taskID: id)).post()
+            }
+        }
+        .onChange(of: feedback) { _, message in
+            if let message { AccessibilityNotification.Announcement(message).post() }
+        }
+        .onChange(of: editingID) { _, id in
+            if let task = store.workspace.tasks.first(where: { $0.id == id }) {
+                if navigation?.tasksOnly == true { cancelNavigation() }
+                preview = nil
+                revealFocusedTask(task)
+            } else { requestCategory(chosen) }
+        }
+        .onChange(of: navigation) { _, navigation in
+            if navigation != nil && pointerMove != nil { finishPointerMove(commit: false); cancelledPointerMove = true }
+        }
+        .onExitCommand(perform: settingsOpen ? nil : {
+            if navigation == .open { cancelNavigation() }
+            else if pointerMove != nil { finishPointerMove(commit: false); cancelledPointerMove = true }
             else if keyboardMove != nil { keyboardMove = nil }
-            else if editingID == nil { pinned = nil; preview = nil; hoveredHour = nil }
+            else if let editingID { self.editingID = nil; focusedTask = editingID }
+            else if pinned != nil || preview != nil || focusedLaneBlock != nil {
+                pinned = nil; preview = nil; hoveredHour = nil
+                if focusedLaneBlock != nil { boardFocus = true }
+            }
+            else { onDismiss() }
+        })
+    }
+
+    private func requestCategory(_ colour: Int) {
+        guard !settingsOpen, !all, editingID == nil, navigation == nil || navigation?.tasksOnly == true else { return }
+        guard let current = displayedColour else { displayedColour = colour; return }
+        if current != colour {
+            navigation = .category(colour)
+        } else if navigation?.tasksOnly == true {
+            cancelNavigation()
         }
     }
 
+    private func cancelNavigation() {
+        navigation = nil
+        if motion.phase == .exiting && !reduceMotion {
+            motion.phase = .entering
+        } else { motion = BoardMotion() }
+    }
+
     private var groupTitles: [String] { Stage.allCases.map(\.rawValue) + ["Done"] }
+
+    private func headingIsPinned(_ title: String, at top: CGFloat) -> Bool {
+        scrollOffset >= 64 && (headerPositions[title] ?? .infinity) < top
+    }
 
     private func dayViewport(blocks: [FocusBlock], visible: [Task], now: Date, active: Date, today: Date,
                              wide: Bool, inset: CGFloat, fade: CGFloat) -> some View {
         let groups = Stage.allCases.map { stage in visible.filter { $0.completedOn == nil && $0.stage == stage } }
             + [visible.filter { $0.completedOn != nil }]
-        let progress = min(1, max(0, scrollOffset / 64))
+        let progress = focusedLaneBlock == nil ? min(1, max(0, scrollOffset / 64)) : 0
         let timelineTop = max(0, inset - scrollOffset)
         let timelineHeight = 64 - progress * 40
         return ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 BoardScrollResolver { view in
                     scrollHost.value = view
-                    if savedScrollOffset > 0 { setBoardOffset(savedScrollOffset) }
+                    if savedScrollOffset > 0 {
+                        setBoardOffset(savedScrollOffset)
+                        savedScrollOffset = 0
+                    }
                 } scrolled: { offset in
                     scrollOffset = max(0, offset)
                 }.frame(height: 0)
@@ -168,7 +342,9 @@ struct Board: View {
                         ForEach(groupTitles.indices, id: \.self) { index in
                             let title = groupTitles[index]
                             let stage = index < Stage.allCases.count ? Stage.allCases[index] : nil
-                            taskGroup(title, stage: stage, tasks: groups[index], now: now, wide: wide)
+                            let top = timelineTop + timelineHeight + CGFloat(index) * 48
+                            taskGroup(title, stage: stage, tasks: groups[index], now: now, wide: wide,
+                                      pinnedHeading: headingIsPinned(title, at: top))
                                 .background {
                                     GeometryReader { geo in
                                         Color.clear.preference(key: DaymarkSectionPositions.self,
@@ -197,62 +373,91 @@ struct Board: View {
                 ForEach(groupTitles.indices, id: \.self) { index in
                     let title = groupTitles[index]
                     let top = timelineTop + timelineHeight + CGFloat(index) * 48
-                    if (headerPositions[title] ?? .infinity) < top && scrollOffset >= 64 {
-                        HStack(spacing: 8) {
-                            Button(title) { jumpToGroup(title) }.buttonStyle(.plain)
-                            Text(groups[index].count, format: .number).foregroundStyle(palette.muted).monospacedDigit()
-                            Spacer()
-                        }
+                    if headingIsPinned(title, at: top) {
+                        taskHeading(title, count: groups[index].count, stage: index < Stage.allCases.count ? Stage.allCases[index] : nil)
                         .padding(.horizontal, inset).frame(height: 48)
                         .background(palette.raised)
                         .offset(y: top)
-                        .accessibilityHidden(true)
                     }
                 }
             }
-            lane(all || needsSetup ? [] : blocks, referenceBlocks: blocks, now: now, active: active, today: today,
+        }
+        .overlay(alignment: .topLeading) {
+            lane(all || store.workspace.needsSetup ? [] : blocks, referenceBlocks: blocks, now: now, active: active, today: today,
                  collapse: progress)
+                .modifier(BoardMotionUnit(.timeline))
                 .padding(.horizontal, inset)
                 .frame(height: timelineHeight, alignment: .top)
                 .clipped()
+                .padding(.top, timelineTop)
                 .background(palette.raised)
-                .offset(y: timelineTop)
         }
-        .accessibilityLabel("Tasks")
+        .background(BoardFrameReader(key: .viewport))
+        .focusable().focusEffectDisabled().focused($boardFocus)
+        .onAppear {
+            if !hasOpenedBoard {
+                hasOpenedBoard = true
+                DispatchQueue.main.async { boardFocus = true }
+            }
+        }
+    }
+
+    private func revealFocusedTask(_ task: Task) {
+        guard let frame = boardFrames[.task(task.id)], let viewport = boardFrames[.viewport] else { return }
+        let group = task.completedOn == nil ? task.stage.rawValue : "Done"
+        let pinnedHeight = 24 + CGFloat(1 + (groupTitles.firstIndex(of: group) ?? 0)) * 48
+        if frame.minY < viewport.minY + pinnedHeight, scrollOffset > 0 {
+            setBoardOffset(scrollOffset + frame.minY - viewport.minY - pinnedHeight)
+        } else if frame.maxY > viewport.maxY {
+            setBoardOffset(scrollOffset + frame.maxY - viewport.maxY)
+        }
     }
 
     private func jumpToGroup(_ title: String) {
         guard let position = headerPositions[title], let index = groupTitles.firstIndex(of: title) else { return }
         let target = max(0, scrollOffset + position - 24 - CGFloat(index) * 48)
-        setBoardOffset(target)
+        setBoardOffset(target, animated: !reduceMotion)
     }
 
-    private func setBoardOffset(_ y: CGFloat) {
+    private func setBoardOffset(_ y: CGFloat, animated: Bool = false) {
         guard let scrollView = scrollHost.value, let document = scrollView.documentView else { return }
         let clip = scrollView.contentView
         let target = min(max(0, y), max(0, document.bounds.height - clip.bounds.height))
-        clip.scroll(to: NSPoint(x: clip.bounds.minX, y: target))
-        scrollView.reflectScrolledClipView(clip)
+        let origin = NSPoint(x: clip.bounds.minX, y: target)
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.24
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                clip.animator().setBoundsOrigin(origin)
+            }
+        } else {
+            clip.scroll(to: origin)
+            scrollView.reflectScrolledClipView(clip)
+        }
     }
 
     private func openSettings() {
         savedScrollOffset = scrollOffset
-        settingsIdentity = UUID()
-        settingsOpen = true
+        setupMode = store.workspace.needsSetup
+        if navigation == .open { cancelNavigation() } else { navigation = .open }
         preview = nil
     }
 
     private func closeSettings(focusComposer: Bool = false) {
-        settingsOpen = false
-        DispatchQueue.main.async {
-            if focusComposer { composerFocus = true }
-            else { settingsFocus = true }
-        }
+        navigation = .close(focusComposer: focusComposer)
     }
 
     private func choose(_ day: Date, today: Date) {
-        if selected != (day == today ? nil : day) { savedScrollOffset = 0; scrollOffset = 0 }
-        selected = day == today ? nil : day
+        let target = day == today ? nil : day
+        if target == selected && !settingsOpen {
+            if case .day = navigation { cancelNavigation() }
+            return
+        }
+        navigation = .day(target)
+    }
+
+    private func resetTaskFilter() {
+        keyboardMove = nil
         pinned = nil
         preview = nil
         hoveredHour = nil
@@ -260,92 +465,136 @@ struct Board: View {
     }
 
     private func dateStrip(_ active: Date, today: Date, width: CGFloat) -> some View {
-        let anchor = min(max(64, dateAnchor ?? width / 2), max(64, width - 64))
-        let maxMinutes = max(1, (0..<7).map { day in store.blocks.filter { $0.day == day }.reduce(0) { $0 + $1.end - $1.start } }.max() ?? 1)
-        let maxSegments = max(1, (0..<7).map { day in store.blocks.filter { $0.day == day }.count }.max() ?? 1)
+        let desktopWidth = (scrollHost.value?.window?.screen ?? NSScreen.main)?.visibleFrame.width ?? width
+        let fadeAnimation: Animation? = reduceMotion ? nil : .timingCurve(0.25, 1, 0.5, 1, duration: 0.14)
+        let placement = requestedTab?.date == active ? requestedTab : tabPlacement
+        let anchor: CGFloat
+        if let placement, placement.date == active, placement.width == width {
+            anchor = placement.center
+        } else {
+            anchor = width / 2
+        }
+        let byDay = Dictionary(grouping: store.blocks, by: \.day)
+        let maxMinutes = max(1, byDay.values.map { $0.reduce(0) { $0 + $1.end - $1.start } }.max() ?? 0)
+        let allocationWidth = max(0, 64 - 2 * CGFloat((byDay.values.map(\.count).max() ?? 1) - 1))
+        let radius = Int(ceil(width / 104))
+        let dates = (-radius...radius).compactMap { offset -> DateTabPlacement? in
+            let x = anchor + CGFloat(offset) * 104
+            // A neighbour at the edge may give up its outer padding. Its date and allocation stay fully visible.
+            let visibleWidth = min(96, 2 * min(x, width - x))
+            guard visibleWidth >= (abs(offset) == 1 ? 64 : 96),
+                  let date = Calendar.current.date(byAdding: .day, value: offset, to: active) else { return nil }
+            return DateTabPlacement(date: date, center: x, width: width)
+        }
         return ZStack(alignment: .topLeading) {
-            ForEach(-12...12, id: \.self) { offset in
-                let x = anchor + CGFloat(offset) * 104
-                if x >= 48, x <= width - 48,
-                   let date = Calendar.current.date(byAdding: .day, value: offset, to: active) {
-                    let blocks = store.blocks.filter { $0.day == Schedule.day(date) }
-                    let hot = offset == 0 || hoveredDate == date || focusedDate == date
-                    let opacity = max(0.15, 1 - abs(x - width / 2) / max(1, width / 2) * 0.85)
-                    Button {
-                        guard offset != 0 else { return }
-                        dateAnchor = x
-                        choose(date, today: today)
-                    } label: {
-                        VStack(spacing: 4) {
-                            Text(date.formatted(.dateTime.day())).font(.system(size: 24))
-                                .monospacedDigit().frame(height: 24)
-                            Text(date.formatted(.dateTime.weekday(.abbreviated)).uppercased())
-                                .font(.system(size: 12)).frame(height: 18)
-                            HStack(spacing: 2) {
-                                ForEach(blocks) { block in
-                                    Capsule()
-                                        .fill(palette.block(block.colour, monochrome: !hot))
-                                        .frame(width: CGFloat(max(1, 64 - 2 * (maxSegments - 1))) * CGFloat(block.end - block.start) / CGFloat(maxMinutes), height: 4)
-                                }
-                            }.frame(height: 4)
-                        }
-                        .frame(width: 96, height: 86)
-                        .foregroundStyle(hot ? palette.text : palette.muted)
-                        .overlay(alignment: .top) {
-                            if offset != 0 && date == today { Circle().fill(palette.text).frame(width: 3, height: 3).padding(.top, 4) }
-                        }
-                        .opacity(hot ? 1 : opacity)
-                        .background(alignment: .bottom) {
-                            if offset == 0 {
-                                FusedDateTab().fill(palette.raised)
-                                    .padding(.horizontal, -16).allowsHitTesting(false)
+            FusedDateTab()
+                .fill(palette.raised)
+                .frame(width: 128, height: 86)
+                .position(x: anchor, y: 43)
+                .animation(reduceMotion ? nil : .timingCurve(0.25, 1, 0.5, 1, duration: 0.4), value: active)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            ForEach(dates) { tab in
+                let date = tab.date
+                let blocks = byDay[Schedule.day(date)] ?? []
+                let hot = date == active || hoveredDate == date || focusedDate == date
+                let opacity = tab.restingOpacity(desktopWidth: desktopWidth)
+                Button {
+                    selectTab(tab, active: active, today: today)
+                } label: {
+                    VStack(spacing: 4) {
+                        Text(date.formatted(.dateTime.day())).font(.system(size: 24))
+                            .monospacedDigit().frame(height: 24)
+                        Text(date.formatted(.dateTime.weekday(.abbreviated)).uppercased())
+                            .font(.system(size: 12)).frame(height: 18)
+                        HStack(spacing: 2) {
+                            ForEach(blocks) { block in
+                                Capsule()
+                                    .fill(palette.block(block.colour, monochrome: !hot))
+                                    .frame(width: allocationWidth * CGFloat(block.end - block.start) / CGFloat(maxMinutes), height: 4)
+                                    .help("\(store.label(block.colour)), \(Schedule.clock(block.start))–\(Schedule.clock(block.end))")
                             }
+                        }.frame(width: 64, height: 4)
+                    }
+                    .frame(width: min(96, 2 * min(tab.center, width - tab.center)), height: 86)
+                    .foregroundStyle(hot ? palette.text : palette.muted)
+                    .overlay(alignment: .top) {
+                        if date != active && date == today {
+                            Circle().fill(palette.text).frame(width: 3, height: 3).padding(.top, 4)
                         }
-                        .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
-                    .focused($focusedDate, equals: date)
-                    .onHover { inside in
-                        if inside { hoveredDate = date }
-                        else if hoveredDate == date { hoveredDate = nil }
-                    }
-                    .accessibilityLabel(date.formatted(.dateTime.weekday(.wide).day().month(.wide).year()))
-                    .accessibilityHint("\(blocks.count) scheduled blocks")
-                    .accessibilityAddTraits(offset == 0 ? .isSelected : [])
-                    .id(date)
-                    .position(x: x, y: 43)
+                    .opacity(hot ? 1 : opacity)
+                    .animation(fadeAnimation, value: hot)
+                    .animation(fadeAnimation, value: opacity)
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(ScheduleButtonStyle())
+                .focusable().focused($focusedDate, equals: date)
+                .focusEffectDisabled()
+                .onKeyPress(.return) {
+                    selectTab(tab, active: active, today: today)
+                    return .handled
+                }
+                .onHover { inside in
+                    if inside { hoveredDate = date }
+                    else if hoveredDate == date { hoveredDate = nil }
+                }
+                .accessibilityLabel(date.formatted(.dateTime.weekday(.wide).day().month(.wide).year()))
+                .accessibilityHint("\(blocks.count) scheduled blocks")
+                .accessibilityAddTraits(date == active ? .isSelected : [])
+                .position(x: tab.center, y: 43)
             }
         }
         .frame(width: width, height: 86)
         .clipped()
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Calendar dates")
+        .contextMenu {
+            Button("Back to today") { choose(today, today: today) }
+        }
+        .onChange(of: active) {
+            tabPlacement = DateTabPlacement(date: active, center: anchor, width: width)
+            requestedTab = nil
+        }
         .accessibilityScrollAction { edge in
             let step = edge == .leading ? -1 : edge == .trailing ? 1 : 0
             guard step != 0, let date = Calendar.current.date(byAdding: .day, value: step, to: active) else { return }
-            dateAnchor = width / 2
-            choose(date, today: today)
+            selectTab(DateTabPlacement(date: date, center: anchor + CGFloat(step) * 104, width: width),
+                      active: active, today: today)
         }
         .onMoveCommand { direction in
             let step = direction == .left ? -1 : direction == .right ? 1 : 0
-            guard step != 0, let date = Calendar.current.date(byAdding: .day, value: step, to: active) else { return }
-            dateAnchor = width / 2
-            choose(date, today: today)
+            let origin = focusedDate ?? active
+            guard step != 0, let date = Calendar.current.date(byAdding: .day, value: step, to: origin) else { return }
+            selectTab(dates.first { $0.date == date } ?? DateTabPlacement(date: date, center: width / 2, width: width),
+                      active: active, today: today)
             focusedDate = date
         }
-        .onChange(of: width) { _, _ in dateAnchor = nil }
+    }
+
+    private func selectTab(_ tab: DateTabPlacement, active: Date, today: Date) {
+        guard tab.date != active else {
+            requestedTab = nil
+            choose(active, today: today)
+            return
+        }
+        // Keep the tab near the click while leaving a full neighbouring day available at either edge.
+        let inset = min(tab.width / 2, 32 + 104)
+        requestedTab = DateTabPlacement(date: tab.date, center: min(max(inset, tab.center), tab.width - inset), width: tab.width)
+        choose(tab.date, today: today)
     }
 
     private func lane(_ blocks: [FocusBlock], referenceBlocks: [FocusBlock], now: Date, active: Date, today: Date, collapse: CGFloat = 0) -> some View {
         let second = Schedule.seconds(now)
-        let minute = hoveredHour ?? (second / 60)
-        let preciseMinute = hoveredHour.map(CGFloat.init) ?? CGFloat(second) / 60
         let thisDay = active == today
         let start = referenceBlocks.isEmpty ? 0 : min(referenceBlocks[0].start, thisDay ? second / 3600 * 60 : 1440)
         let end = referenceBlocks.isEmpty ? 1440 : max(referenceBlocks.last?.end ?? 1440, thisDay ? (second / 3600 + 1) * 60 : 0)
-        let marks = all ? [] : blocks
+        let hoverMinute = hoveredHour.map { min(end, max(start, $0)) }
+        let minute = hoverMinute ?? second / 60
+        let preciseMinute = hoverMinute.map(CGFloat.init) ?? CGFloat(second) / 60
+        let marks = blocks
         let blend = focusedLaneBlock != nil ? 0 : min(max(0, collapse), 1)
+        let laneHeight = 64 - 40 * blend
         let labelsOpacity = max(0, 1 - blend / 0.6)
         let barHeight = 32 - 28 * blend
         let barY = 10 * blend
@@ -370,8 +619,7 @@ struct Board: View {
                     let length = max(1, endX - startX - leading - trailing)
                     let colour = palette.block(block.colour)
                     Button {
-                        preview = nil
-                        pinned = pinned == block.colour ? nil : block.colour
+                        toggleLaneBlock(block)
                     } label: {
                         ZStack(alignment: .leading) {
                             colour
@@ -396,13 +644,27 @@ struct Board: View {
                         .frame(width: length, height: barHeight)
                         .clipShape(Capsule())
                         .overlay {
-                            if pinned == block.colour && blend < 0.6 {
-                                Capsule().strokeBorder(palette.blockText, lineWidth: 2).padding(4)
+                            if focusedLaneBlock == block.id || pinned == block.colour {
+                                let dashed = focusedLaneBlock == block.id
+                                Capsule().inset(by: 3)
+                                    .stroke(palette.blockText, style: StrokeStyle(lineWidth: 2, dash: dashed ? [4, 3] : []))
+                                    .opacity(labelsOpacity)
                             }
                         }
                     }
-                    .buttonStyle(.plain)
-                    .focused($focusedLaneBlock, equals: block.id)
+                    .buttonStyle(ScheduleButtonStyle())
+                    .focusable().focused($focusedLaneBlock, equals: block.id)
+                    .focusEffectDisabled()
+                    .onKeyPress(.return) {
+                        toggleLaneBlock(block)
+                        return .handled
+                    }
+                    .onKeyPress(.escape) {
+                        preview = nil
+                        pinned = nil
+                        hoveredHour = nil
+                        return .handled
+                    }
                     .offset(x: startX + leading, y: barY)
                     .accessibilityHint("Toggle this block’s tasks")
                     .accessibilityLabel("\(store.label(block.colour)), \(Schedule.clock(block.start)) to \(Schedule.clock(block.end))")
@@ -426,15 +688,16 @@ struct Board: View {
                         .accessibilityLabel("\(hoveredHour == nil ? "Current" : "Timeline") time \(Schedule.clock(minute))")
                 }
             }
-            .frame(width: width, height: 64)
+            .frame(width: width, height: laneHeight, alignment: .topLeading)
             .contentShape(Rectangle())
             .onContinuousHover { event in
                 switch event {
                 case .active(let location):
-                    guard width > 0, (0...64).contains(location.y) else { return }
+                    guard width > 0, (0...laneHeight).contains(location.y) else { return }
                     let anchorMinute = CGFloat(start) + location.x / width * CGFloat(end - start)
                     hoveredHour = min(end, max(start, Int((anchorMinute / 60).rounded()) * 60))
-                    if editingID == nil && NSEvent.pressedMouseButtons == 0 {
+                    if editingID == nil, focusedTask == nil, focusedCheckbox == nil, keyboardMove == nil,
+                       pointerMove == nil, NSEvent.pressedMouseButtons == 0 {
                         preview = marks.first { anchorMinute >= CGFloat($0.start) && anchorMinute < CGFloat($0.end) }?.colour
                     }
                 case .ended:
@@ -442,22 +705,112 @@ struct Board: View {
                     preview = nil
                 }
             }
-        }.frame(height: 64).clipped()
+        }
+        .frame(height: laneHeight).clipped().contentShape(Rectangle())
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(Schedule.weekdays[Schedule.day(active)]) timeline")
     }
 
+    private func toggleLaneBlock(_ block: FocusBlock) {
+        preview = nil
+        pinned = pinned == block.colour ? nil : block.colour
+    }
 
-    private func taskGroup(_ title: String, stage: Stage?, tasks: [Task], now: Date, wide: Bool) -> some View {
+    private var dropTarget: Stage? {
+        guard let point = pointerMove?.location, taskViewport.contains(point) else { return nil }
+        if point.y < taskViewport.minY + max(24, 64 - scrollOffset) { return nil }
+        // Sticky headings are rendered over the underlying columns.
+        if let heading = groupTitles.last(where: { boardFrames[.heading($0)]?.contains(point) == true }) {
+            return Stage(rawValue: heading)
+        }
+        return Stage.allCases.first { boardFrames[.column($0)]?.contains(point) == true }
+    }
+
+    private func taskDragSurface<Content: View>(_ content: Content) -> some View {
+        content
+            .overlay(alignment: .topLeading) {
+                if let drag = pointerMove {
+                    taskCard(drag.task, now: .now, stretch: true, allowsWrap: drag.task.stage == .now, ghost: true)
+                        .frame(width: drag.frame.width, height: drag.frame.height, alignment: .topLeading)
+                        .shadow(color: palette.text.opacity(0.12), radius: 16, y: 6)
+                        .offset(x: drag.frame.minX, y: drag.frame.minY)
+                        .accessibilityHidden(true).allowsHitTesting(false)
+                }
+            }
+            .coordinateSpace(name: "task-drag-surface")
+            .onPreferenceChange(BoardFrames.self) { boardFrames = $0 }
+            .task(id: pointerMove?.task.id) {
+                while let pointer = pointerMove?.location, !_Concurrency.Task.isCancelled {
+                    let edge = min(48, taskViewport.height / 4)
+                    if pointer.y < taskViewport.minY + edge { setBoardOffset(scrollOffset - 10) }
+                    else if pointer.y > taskViewport.maxY - edge { setBoardOffset(scrollOffset + 10) }
+                    do { try await _Concurrency.Task.sleep(for: .milliseconds(16)) } catch { return }
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+                if NSEvent.pressedMouseButtons == 0 { cancelledPointerMove = false }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { _ in
+                if pointerMove != nil { finishPointerMove(commit: false); cancelledPointerMove = NSEvent.pressedMouseButtons != 0 }
+                keyboardMove = nil
+            }
+    }
+
+    private func trackPointer(_ value: DragGesture.Value, task: Task) {
+        guard !cancelledPointerMove, task.completedOn == nil else { return }
+        NSCursor.closedHand.set()
+        if pointerMove == nil, let bounds = boardFrames[.task(task.id)] {
+            keyboardMove = nil
+            focusedTask = task.id
+            pointerMove = TaskPointerMove(task: task, origin: bounds,
+                                          start: value.startLocation, location: value.location)
+        } else {
+            pointerMove?.location = value.location
+        }
+    }
+
+    private func finishPointerMove(commit: Bool) {
+        guard let drag = pointerMove else { return }
+        let target = commit ? dropTarget : nil
+        NSCursor.arrow.set()
+        settle(from: drag) {
+            pointerMove = nil
+            if let target { move(drag.task.id, to: target, restoreFocus: false) }
+        }
+    }
+
+    private func settle(from drag: TaskPointerMove? = nil, _ update: () -> Void) {
+        guard !reduceMotion else { update(); return }
+        settleGeneration += 1
+        let generation = settleGeneration
+        var frames = boardFrames
+        if let drag { frames[.task(drag.task.id)] = drag.frame }
+        settleFrames = frames
+        settling = true
+        update()
+        DispatchQueue.main.async {
+            guard settleGeneration == generation else { return }
+            withAnimation(.timingCurve(0.25, 1, 0.5, 1, duration: 0.4)) { settling = false }
+        }
+    }
+
+    private func taskGroup(_ title: String, stage: Stage?, tasks: [Task], now: Date, wide: Bool, pinnedHeading: Bool) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             taskHeading(title, count: tasks.count, stage: stage)
+                .accessibilityHidden(pinnedHeading)
+                .allowsHitTesting(!pinnedHeading)
             taskList(stage, tasks: tasks, now: now, wide: wide)
                 .padding(.top, 12)
                 .padding(.bottom, stage == nil ? 0 : 48)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            if let stage { BoardFrameReader(key: .column(stage)) }
+        }
     }
 
-    @ViewBuilder private func taskList(_ stage: Stage?, tasks: [Task], now: Date, wide: Bool) -> some View {
-        let list = Group {
+    private func taskList(_ stage: Stage?, tasks: [Task], now: Date, wide: Bool) -> some View {
+        Group {
             if stage == .now && wide {
                 EqualTaskRow(gap: 16) {
                     ForEach(tasks) { task in taskRow(task, now: now, stretch: true, allowsWrap: true) }
@@ -467,54 +820,57 @@ struct Board: View {
                     ForEach(tasks) { task in taskRow(task, now: now, stretch: false, allowsWrap: stage == .now) }
                 }
             }
-        }.frame(maxWidth: .infinity, minHeight: 48, alignment: .topLeading)
-        if let stage {
-            list
-                .background {
-                    if dropTarget == stage || keyboardMove?.destination == stage {
-                        RoundedRectangle(cornerRadius: 24).fill(palette.muted.opacity(0.08))
-                    }
-                }
-                .onDrop(of: [.daymarkTask], isTargeted: Binding(get: { dropTarget == stage }, set: {
-                    if $0 { dropTarget = stage }
-                    else if dropTarget == stage { dropTarget = nil }
-                })) { providers in
-                    guard let provider = providers.first else { return false }
-                    provider.loadDataRepresentation(forTypeIdentifier: UTType.daymarkTask.identifier) { data, _ in
-                        guard let data, let value = String(data: data, encoding: .utf8), let id = UUID(uuidString: value) else { return }
-                        DispatchQueue.main.async { move(id, to: stage) }
-                    }
-                    return true
-                }
-        } else { list }
+        }
+        .frame(maxWidth: .infinity, minHeight: 48, alignment: .topLeading)
+        .background {
+            if let stage, dropTarget == stage || keyboardMove?.destination == stage {
+                RoundedRectangle(cornerRadius: 24).fill(palette.muted.opacity(0.08))
+            }
+        }
     }
 
     private func taskHeading(_ title: String, count: Int, stage: Stage?) -> some View {
         HStack(spacing: 8) {
-            Button(title) { jumpToGroup(title) }.buttonStyle(.plain)
+            Button { jumpToGroup(title) } label: { Text(title).frame(height: 48).contentShape(Rectangle()) }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 4)
+                .daymarkFocusRing(in: RoundedRectangle(cornerRadius: 8), palette: palette)
+                .padding(.horizontal, -4)
                 .accessibilityLabel("Scroll to \(title) tasks")
             Text(count, format: .number).foregroundStyle(palette.muted).monospacedDigit()
             Spacer()
             if let stage, keyboardMove?.destination == stage || dropTarget == stage {
-                let blocked = stage == .now && !store.canEnterNow(excluding: keyboardMove?.id)
-                Text(blocked ? "Now is full" : "Move to \(title)")
-                    .font(.system(size: 12)).foregroundStyle(palette.muted)
+                let id = pointerMove?.task.id ?? keyboardMove?.id
+                Text(destinationHint(stage, taskID: id))
+                    .foregroundStyle(palette.muted)
             }
         }
         .frame(height: 48)
         .accessibilityAddTraits(.isHeader)
+        .modifier(TaskSettle(origin: settling ? settleFrames[.heading(title)] : nil))
+        .modifier(BoardMotionUnit(.heading(title)))
+    }
+
+    private func destinationHint(_ stage: Stage, taskID: UUID?) -> String {
+        if stage == .now && !store.canEnterNow(excluding: taskID) { return "Now is full" }
+        let same = store.workspace.tasks.first { $0.id == taskID }?.stage == stage
+        return "\(same ? "Keep in" : "Move to") \(stage.rawValue)"
+    }
+
+    private func togglePickup(_ task: Task) {
+        if let moveState = keyboardMove, moveState.id == task.id {
+            keyboardMove = nil
+            if moveState.destination != task.stage { settle { move(task.id, to: moveState.destination) } }
+        } else {
+            keyboardMove = KeyboardTaskMove(id: task.id, destination: task.stage)
+        }
     }
 
     private func handleMoveKey(_ press: KeyPress, task: Task) -> KeyPress.Result {
         guard task.completedOn == nil else { return .ignored }
         switch press.key {
         case .space, .return:
-            if let moveState = keyboardMove, moveState.id == task.id {
-                keyboardMove = nil
-                if moveState.destination != task.stage { move(task.id, to: moveState.destination) }
-            } else {
-                keyboardMove = KeyboardTaskMove(id: task.id, destination: task.stage)
-            }
+            togglePickup(task)
             return .handled
         case .leftArrow, .upArrow, .rightArrow, .downArrow:
             guard var active = keyboardMove, active.id == task.id else { return .ignored }
@@ -530,35 +886,78 @@ struct Board: View {
     }
 
     private func taskRow(_ task: Task, now: Date, stretch: Bool, allowsWrap: Bool) -> some View {
-        return HStack(alignment: .top, spacing: 10) {
-            Button {
-                feedback = store.toggle(task.id, at: now) ? nil : "Now is full. Move or complete a task first."
-            } label: {
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(palette.raised)
-                    .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(palette.taskCheckboxBorder) }
-                    .frame(width: 20, height: 20)
-                    .overlay {
-                        if task.completedOn != nil { Image(systemName: "checkmark").font(.system(size: 10, weight: .semibold)) }
+        taskCard(task, now: now, stretch: stretch, allowsWrap: allowsWrap, ghost: false)
+            .modifier(TaskSettle(origin: settling ? settleFrames[.task(task.id)] : nil))
+            .modifier(BoardMotionUnit(.task(task.id)))
+            .contextMenu {
+                Button("Edit Task") { editingID = task.id }
+                if task.completedOn == nil {
+                    Menu("Move to") {
+                        ForEach(Stage.allCases) { stage in
+                            Button(stage.rawValue) { move(task.id, to: stage) }
+                                .disabled(stage == .now && !store.canEnterNow(excluding: task.id))
+                        }
                     }
+                }
+                Menu("Focus block") {
+                    ForEach(store.workspace.settings.labels.indices, id: \.self) { colour in
+                        Button(store.label(colour)) { _ = store.edit(task.id, title: task.title, colour: colour) }
+                    }
+                }
+                Button("Delete…", role: .destructive) { deleteTask = task }
             }
-            .accessibilityLabel(task.completedOn == nil ? "Complete \(task.title)" : "Reopen \(task.title)")
-            .buttonStyle(.plain)
-            .padding(.top, 12)
-            InlineTaskTitle(task: task, palette: palette, allowsWrap: allowsWrap,
-                            editingID: $editingID, focusedTask: $focusedTask,
-                            keyHandler: { handleMoveKey($0, task: task) }) { title, removeEmpty in
-                if removeEmpty && title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { _ = store.delete(task.id) }
-                else { _ = store.edit(task.id, title: title, colour: min(task.colour, store.workspace.settings.labels.count - 1)) }
+    }
+
+    private func taskCard(_ task: Task, now: Date, stretch: Bool, allowsWrap: Bool, ghost: Bool) -> some View {
+        let dragging = !ghost && pointerMove?.task.id == task.id
+        return HStack(alignment: .top, spacing: 10) {
+            if ghost {
+                checkboxMark(completed: false).padding(.top, 12)
+                TaskTitleLabel(task: task, palette: palette, allowsWrap: allowsWrap)
+                    .padding(.vertical, 12).frame(minHeight: 44, alignment: .leading)
+            } else {
+                Button { toggleTask(task.id, at: now) } label: { checkboxMark(completed: task.completedOn != nil) }
+                    .buttonStyle(.plain)
+                    .focused($focusedCheckbox, equals: task.id)
+                    .accessibilityRepresentation {
+                        Toggle("Complete \(task.title)", isOn: Binding(get: { task.completedOn != nil }, set: { checked in
+                            if checked != (task.completedOn != nil) { toggleTask(task.id, at: now) }
+                        })).toggleStyle(.checkbox).labelsHidden().frame(width: 20, height: 20)
+                    }
+                    .frame(width: 20, height: 20)
+                    .daymarkFocusRing(focusedCheckbox == task.id, in: RoundedRectangle(cornerRadius: 8), palette: palette)
+                    .padding(.top, 12)
+                InlineTaskTitle(task: task, palette: palette, allowsWrap: allowsWrap,
+                                editingID: $editingID, focusedTask: $focusedTask,
+                                dragging: keyboardMove?.id == task.id,
+                                activate: {
+                                    if task.completedOn != nil { editingID = task.id; return }
+                                    focusedTask = task.id
+                                    togglePickup(task)
+                                },
+                                dragChanged: { trackPointer($0, task: task) },
+                                dragEnded: { value in
+                                    if !cancelledPointerMove {
+                                        pointerMove?.location = value.location
+                                        finishPointerMove(commit: true)
+                                    }
+                                    cancelledPointerMove = false
+                                },
+                                keyHandler: { handleMoveKey($0, task: task) }) { title, removeEmpty in
+                    if removeEmpty && title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        _ = store.delete(task.id)
+                    } else {
+                        _ = store.edit(task.id, title: title, colour: min(task.colour, store.workspace.settings.labels.count - 1))
+                    }
+                }
             }
-            .padding(.vertical, 12)
-            .frame(minHeight: 44)
         }
+        .opacity(dragging ? 0.2 : 1)
         .padding(.leading, 12)
         .padding(.trailing, all ? 28 : 12)
         .padding(.vertical, allowsWrap ? 8 : 4)
         .frame(maxWidth: stretch ? .infinity : nil, maxHeight: stretch ? .infinity : nil, alignment: .topLeading)
-        .background(allowsWrap ? palette.nowTask : palette.page, in: RoundedRectangle(cornerRadius: 24))
+        .background(dragging ? Color.clear : (ghost || allowsWrap ? palette.nowTask : palette.page), in: RoundedRectangle(cornerRadius: 24))
         .overlay {
             if keyboardMove?.id == task.id {
                 RoundedRectangle(cornerRadius: 24).strokeBorder(palette.block(task.colour), lineWidth: 2)
@@ -568,36 +967,39 @@ struct Board: View {
         .overlay(alignment: .topTrailing) {
             if all {
                 Circle().fill(palette.block(task.colour)).frame(width: 6, height: 6)
-                    .padding(14).allowsHitTesting(false)
+                    .padding(14).opacity(dragging ? 0.2 : 1).allowsHitTesting(false)
                     .accessibilityLabel(store.label(task.colour))
             }
         }
-        .contextMenu {
-            Button("Edit Task") { editingID = task.id }
-            if task.completedOn == nil {
-                Menu("Move to") {
-                    ForEach(Stage.allCases) { stage in
-                        Button(stage.rawValue) { move(task.id, to: stage) }
-                            .disabled(stage == .now && !store.canEnterNow(excluding: task.id))
-                    }
-                }
+
+    }
+
+    private func checkboxMark(completed: Bool) -> some View {
+        RoundedRectangle(cornerRadius: 8)
+            .fill(palette.raised)
+            .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(palette.taskCheckboxBorder) }
+            .frame(width: 20, height: 20)
+            .overlay {
+                if completed { Image(systemName: "checkmark").font(.system(size: 10, weight: .semibold)) }
             }
-            Menu("Focus block") {
-                ForEach(store.workspace.settings.labels.indices, id: \.self) { colour in
-                    Button(store.label(colour)) { _ = store.edit(task.id, title: task.title, colour: colour) }
-                }
-            }
-            Button("Delete…", role: .destructive) { deleteTask = task }
+    }
+
+    private func toggleTask(_ id: UUID, at now: Date) {
+        feedback = store.toggle(id, at: now) ? nil : store.error ?? "Now is full. Move or complete a task first."
+    }
+
+    private func move(_ id: UUID, to stage: Stage, restoreFocus: Bool = true) {
+        guard let task = store.workspace.tasks.first(where: { $0.id == id }), task.stage != stage else { return }
+        guard store.move(id, stage) else {
+            feedback = store.error ?? "Now is full. Move or complete a task first."
+            return
         }
+        feedback = nil
+        AccessibilityNotification.Announcement("Moved \(task.title) to \(stage.rawValue).").post()
+        if restoreFocus { DispatchQueue.main.async { focusedTask = id } }
     }
 
-    private func move(_ id: UUID, to stage: Stage) {
-        let changed = store.move(id, stage)
-        feedback = changed ? nil : "Now is full. Move or complete a task first."
-        if changed { DispatchQueue.main.async { focusedTask = id } }
-    }
-
-    private func composer(_ activeColour: Int) -> some View {
+    private func composer(_ activeColour: Int, compact: Bool) -> some View {
         let count = store.workspace.settings.labels.count
         let first = store.workspace.settings.onboardingComplete && store.workspace.tasks.isEmpty
         let colour = min(taskColour ?? activeColour, count - 1)
@@ -609,75 +1011,66 @@ struct Board: View {
                 draft = ""; taskStage = .later; feedback = nil; composerFocus = true
             }
         }
-        return HStack(spacing: 8) {
-            Button {
-                dateAnchor = nil
-                choose(Calendar.current.startOfDay(for: .now), today: Calendar.current.startOfDay(for: .now))
-                if settingsOpen { closeSettings() }
-            } label: {
-                DaymarkToolbarBrand().fill(palette.text)
-                    .frame(width: 40, height: 40)
-                    .frame(width: 44, height: 44)
-                    .background(palette.raised, in: Circle())
-            }
-            .buttonStyle(.plain)
-            .help("Back to today")
-            .accessibilityLabel("Back to today")
-            HStack(spacing: 6) {
-                Button {
-                    composerMenu = .block
+        let gap: CGFloat = compact ? 4 : 6
+        let submitSize: CGFloat = compact ? 32 : 36
+        let toolbarSize: CGFloat = compact ? 36 : 44
+        return HStack(spacing: 4) {
+            HStack(spacing: gap) {
+                Menu {
+                    Picker("Task block", selection: Binding(get: { colour }, set: { taskColour = $0 })) {
+                        ForEach(0..<count, id: \.self) { index in
+                            Text(store.label(index)).tag(index)
+                        }
+                    }
+                    .pickerStyle(.inline)
                 } label: {
-                    Circle().fill(palette.block(colour)).frame(width: 12, height: 12)
-                        .frame(width: 32, height: 40).contentShape(Rectangle())
+                    Image(systemName: "circle.fill").symbolRenderingMode(.palette)
+                        .foregroundStyle(palette.block(colour)).font(.system(size: 12))
+                        .frame(width: compact ? 24 : 32, height: 40)
+                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .menuIndicator(.hidden)
+                .daymarkFocusRing(in: Capsule(), palette: palette)
                 .help(store.label(colour))
                 .accessibilityLabel("Task block, \(store.label(colour))")
-                .popover(isPresented: Binding(get: { composerMenu == .block }, set: { if !$0 { composerMenu = nil } })) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(0..<count, id: \.self) { index in
-                            Button {
-                                taskColour = index; composerMenu = nil
-                            } label: {
-                                HStack {
-                                    Circle().fill(palette.block(index)).frame(width: 8, height: 8)
-                                    Text(store.label(index))
-                                    Spacer()
-                                    if index == colour { Image(systemName: "checkmark") }
-                                }.padding(5).frame(minWidth: 125)
-                            }.buttonStyle(.plain)
+                Menu {
+                    ForEach(Stage.allCases) { option in
+                        Button {
+                            taskStage = option
+                        } label: {
+                            if option == stage { Label(option.rawValue, systemImage: "checkmark") }
+                            else { Text(option.rawValue) }
                         }
-                    }.padding(8)
-                }
-                Button {
-                    composerMenu = .stage
+                        .disabled(option == .now && !store.canEnterNow())
+                    }
                 } label: {
-                    HStack(spacing: 6) {
-                        Text(stage.rawValue)
-                        Image(systemName: "chevron.down").font(.system(size: 8))
-                    }.frame(width: 72, height: 40, alignment: .leading).contentShape(Rectangle())
+                    // AppKit's borderless menu normalizes a text-and-image label to a leading icon.
+                    // Use a custom button label so the disclosure stays at the trailing edge.
+                    HStack(spacing: gap) {
+                        Text(stage.rawValue).font(.system(size: 16)).fixedSize()
+                        if !compact { Spacer(minLength: 0) }
+                        Image(systemName: "chevron.down").font(.system(size: 10, weight: .medium))
+                            .accessibilityHidden(true)
+                    }
+                    .frame(width: compact ? 56 : 68, height: 32).contentShape(Rectangle())
+                    .accessibilityElement(children: .combine)
                 }
+                .menuStyle(.button)
                 .buttonStyle(.plain)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .padding(.horizontal, 3)
+                .daymarkFocusRing(in: RoundedRectangle(cornerRadius: 8), palette: palette)
+                .padding(.horizontal, -3)
                 .accessibilityLabel("Task stage, \(stage.rawValue)")
-                .popover(isPresented: Binding(get: { composerMenu == .stage }, set: { if !$0 { composerMenu = nil } })) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(Stage.allCases) { option in
-                            Button {
-                                taskStage = option; composerMenu = nil
-                            } label: {
-                                HStack {
-                                    Text(option.rawValue); Spacer()
-                                    if option == stage { Image(systemName: "checkmark") }
-                                }.padding(5).frame(minWidth: 80)
-                            }.buttonStyle(.plain)
-                            .disabled(option == .now && !store.canEnterNow())
-                        }
-                    }.padding(8)
-                }
                 TextField("New task", text: $draft,
-                          prompt: Text(first ? "Add your first task…" : "Add a task…").foregroundStyle(palette.muted))
+                          prompt: Text(first ? "Add your first task…" : "Add a task…")
+                            .foregroundStyle(composerFocus ? palette.text.opacity(0.65) : palette.muted))
                     .textFieldStyle(.plain)
                     .focused($composerFocus)
+                    .focusEffectDisabled()
                     .onSubmit(submit)
                     .onChange(of: draft) { _, text in
                         if text.count > 240 { draft = String(text.prefix(240)) }
@@ -686,30 +1079,37 @@ struct Board: View {
                     .accessibilityLabel("New task")
                 Button(action: submit) {
                     Text("↑").font(.system(size: 14))
-                        .frame(width: 36, height: 36).foregroundStyle(palette.page)
+                        .frame(width: submitSize, height: submitSize).foregroundStyle(palette.page)
                         .background(palette.text, in: Circle())
                         .opacity(enabled ? 1 : 0.4)
-                }.buttonStyle(.plain).disabled(!enabled).accessibilityLabel("Add task")
+                }
+                .buttonStyle(ScheduleButtonStyle())
+                .daymarkFocusRing(in: Circle(), palette: palette)
+                .disabled(!enabled)
+                .accessibilityLabel("Add task")
             }
             .font(.system(size: 16))
-            .padding(.horizontal, 6).padding(.vertical, 4)
-            .background(palette.raised, in: Capsule())
-            toolbarButton(.list, label: all ? "Return to focus" : "Show all tasks", selected: all) {
-                if settingsOpen { closeSettings() }
-                savedScrollOffset = 0
-                all.toggle(); pinned = nil; preview = nil
+            .padding(.horizontal, gap).padding(.vertical, 4)
+            .background(composerFocus ? palette.toolbarSelected : palette.raised, in: Capsule())
+            toolbarButton(.list, label: all ? "Return to focus" : "Show all tasks", selected: all, size: toolbarSize) {
+                if case .taskView = navigation {
+                    cancelNavigation()
+                } else {
+                    navigation = .taskView(!all)
+                }
             }
-            toolbarButton(.settings, label: "Configure your schedule") {
-                if settingsOpen { closeSettings() }
-                else { openSettings() }
+            .daymarkFocusRing(in: Circle(), palette: palette)
+            toolbarButton(.settings, label: "Configure your schedule", size: toolbarSize) {
+                openSettings()
             }
             .focusable().focused($settingsFocus)
+            .daymarkFocusRing(settingsFocus, in: Circle(), palette: palette)
             .accessibilityLabel("Settings")
-            .accessibilityValue(settingsOpen ? "Expanded" : "Collapsed")
+            .accessibilityValue("Collapsed")
         }.frame(maxWidth: 760).frame(maxWidth: .infinity)
     }
 
-    private func toolbarButton(_ glyph: DaymarkToolbarGlyph, label: String, selected: Bool = false, action: @escaping () -> Void) -> some View {
+    private func toolbarButton(_ glyph: DaymarkToolbarGlyph, label: String, selected: Bool = false, size: CGFloat, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Canvas { context, size in
                 let color = glyph == .settings || selected ? palette.text : palette.muted
@@ -740,74 +1140,52 @@ struct Board: View {
                 }
             }
             .frame(width: 20, height: 20)
-            .frame(width: 44, height: 44)
+            .frame(width: size, height: size)
             .background(selected ? palette.toolbarSelected : palette.raised, in: Circle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(ScheduleButtonStyle())
         .accessibilityLabel(label)
         .accessibilityAddTraits(selected ? .isSelected : [])
         .help(label)
     }
 
-    private func icon(_ symbol: String, _ label: String, selected: Bool = false, smaller: Bool = false, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: smaller ? 11 : 16))
-                .frame(width: smaller ? 24 : 44, height: smaller ? 30 : 44)
-                .foregroundStyle(selected ? palette.text : palette.muted)
-                .background(smaller ? .clear : selected ? palette.border : palette.raised, in: Circle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(label)
-        .help(label)
-    }
 }
-
 
 private enum DaymarkToolbarGlyph { case list, settings }
 
-private struct DaymarkToolbarBrand: View {
-    var tint: Color = .primary
-    func fill(_ color: Color) -> Self { Self(tint: color) }
-    var body: some View {
-        Canvas { original, size in
-            let scale = size.height * 1.033 / 320
-            let center = CGPoint(x: size.width / 2, y: size.height / 2)
-            func mapped(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
-                CGPoint(x: center.x + (x - 120) * scale, y: center.y + (y - 160) * scale)
-            }
-            func circle(_ radius: CGFloat) -> Path {
-                Path(ellipseIn: CGRect(x: center.x - radius * scale, y: center.y - radius * scale,
-                                       width: 2 * radius * scale, height: 2 * radius * scale))
-            }
-            var clipped = original
-            clipped.clip(to: circle(102))
-            let parts: [[(CGFloat, CGFloat)]] = [
-            [(113, 33), (127, 33), (127, 287), (113, 287)],
-            [(247, 167), (247, 153), (132, 153), (132, 167), (240, 167)],
-            [(0, 153), (-7, 153), (-7, 167), (108, 167), (108, 153)],
-            [(243.13, 169.391), (249.391, 156.87), (132, 98.1738), (132, 113.826), (236.87, 166.261)],
-            [(43.1305, 53.739), (36.8695, 50.6085), (30.6085, 63.1305), (83.3993, 89.5259), (87.8904, 76.119)],
-            [(108, 101.826), (108, 97.9422), (106.886, 101.269)],
-            [(203.13, 269.391), (209.391, 256.87), (156.601, 230.474), (152.11, 243.881), (196.87, 266.261)],
-            [(132, 218.174), (132, 222.058), (133.114, 218.731)],
-            [(3.13049, 153.739), (-3.13049, 150.609), (-9.39149, 163.13), (108, 221.826), (108, 206.174)],
-            [(115.861, 55.5861), (102.586, 51.139), (70.1377, 148), (84.9023, 148), (113.637, 62.2235)],
-            [(33.3625, 257.776), (31.139, 264.414), (44.4139, 268.861), (76.8623, 172), (62.0977, 172)],
-            [(208.861, 55.5861), (195.586, 51.139), (163.138, 148), (177.902, 148), (206.637, 62.2235)],
-            [(126.363, 257.776), (124.139, 264.414), (137.414, 268.861), (169.862, 172), (155.098, 172)],
-            ]
-            for part in parts {
-                guard let first = part.first else { continue }
-                var path = Path()
-                path.move(to: mapped(first.0, first.1))
-                for p in part.dropFirst() { path.addLine(to: mapped(p.0, p.1)) }
-                path.closeSubpath()
-                clipped.fill(path, with: .color(tint))
-            }
-            original.stroke(circle(108), with: .color(tint), lineWidth: 16 * scale)
+private struct BoardControlFocusRing<Outline: InsettableShape>: ViewModifier {
+    let shape: Outline
+    let palette: DaymarkPalette
+    @FocusState private var focused: Bool
+
+    func body(content: Content) -> some View {
+        content.focused($focused)
+            .daymarkFocusRing(focused, in: shape, palette: palette)
+    }
+}
+
+private extension View {
+    func daymarkFocusRing(in shape: some InsettableShape, palette: DaymarkPalette) -> some View {
+        modifier(BoardControlFocusRing(shape: shape, palette: palette))
+    }
+}
+
+struct DateTabPlacement: Identifiable {
+    let date: Date
+    let center: CGFloat
+    let width: CGFloat
+    var id: Date { date }
+
+    func restingOpacity(desktopWidth: CGFloat) -> CGFloat {
+        let halfStrip: CGFloat
+        if desktopWidth > 640 {
+            // The desktop web strip leaves at least 24 points per side and aligns to a 32-point grid from the centre.
+            halfStrip = floor((desktopWidth / 2 - 24) / 32) * 32
+        } else {
+            halfStrip = desktopWidth / 2 - (desktopWidth <= 380 ? 8 : 16)
         }
-        .accessibilityHidden(true)
+        let distance = abs(center - width / 2)
+        return max(0.15, 1 - 0.85 * distance / max(1, halfStrip))
     }
 }
 
@@ -858,6 +1236,10 @@ private struct InlineTaskTitle: View {
     let allowsWrap: Bool
     @Binding var editingID: UUID?
     var focusedTask: FocusState<UUID?>.Binding
+    let dragging: Bool
+    let activate: () -> Void
+    let dragChanged: (DragGesture.Value) -> Void
+    let dragEnded: (DragGesture.Value) -> Void
     let keyHandler: (KeyPress) -> KeyPress.Result
     let commit: (String, Bool) -> Void
     @State private var draft = ""
@@ -869,9 +1251,21 @@ private struct InlineTaskTitle: View {
                 TextField("Task title", text: $draft, axis: .vertical)
                     .textFieldStyle(.plain).lineLimit(1...)
                     .focused($editorFocused)
-                    .onAppear { draft = task.title; editorFocused = true }
+                    .padding(.vertical, 12).frame(minHeight: 44)
+                    .padding(.horizontal, 4)
+                    .daymarkFocusRing(editorFocused, in: RoundedRectangle(cornerRadius: 8), palette: palette)
+                    .padding(.horizontal, -4)
+                    .onAppear {
+                        draft = task.title
+                        DispatchQueue.main.async { if editingID == task.id { editorFocused = true } }
+                    }
                     .onKeyPress(keys: [.return], phases: .down) { press in
-                        if press.modifiers.contains(.shift) { return .ignored }
+                        let editor = NSApp.keyWindow?.firstResponder as? NSTextView
+                        if editor?.hasMarkedText() == true { return .ignored }
+                        if press.modifiers.contains(.shift), let editor {
+                            editor.insertText("\n", replacementRange: editor.selectedRange())
+                            return .handled
+                        }
                         finish(save: true); return .handled
                     }
                     .onKeyPress(.escape) { finish(save: false); return .handled }
@@ -880,35 +1274,43 @@ private struct InlineTaskTitle: View {
                     }
                     .accessibilityLabel("Edit task title")
             } else {
-                let split = task.completedOn == nil ? task.title.firstIndex(of: ".") : nil
-                let title = split.map { String(task.title.prefix(through: $0)) } ?? task.title
-                let description = split.map { String(task.title.suffix(from: task.title.index(after: $0))) } ?? ""
-                let label = (Text(title).foregroundColor(task.completedOn == nil ? palette.text : palette.muted)
-                    + Text(description).foregroundColor(palette.muted))
-                    .lineLimit(allowsWrap ? nil : 1).truncationMode(.tail)
-                    .fixedSize(horizontal: false, vertical: allowsWrap)
-                Group {
-                    if task.completedOn == nil {
-                        label.onDrag {
-                            let provider = NSItemProvider()
-                            provider.registerDataRepresentation(forTypeIdentifier: UTType.daymarkTask.identifier, visibility: .ownProcess) { completion in
-                                completion(Data(task.id.uuidString.utf8), nil)
-                                return nil
-                            }
-                            return provider
-                        }
-                    } else { label.strikethrough() }
-                }
-                .focusable().focused(focusedTask, equals: task.id)
-                .onKeyPress(keys: [.space, .return, .leftArrow, .rightArrow, .upArrow, .downArrow, .escape], phases: .down, action: keyHandler)
-                .onTapGesture(count: 2) { editingID = task.id }
-                .onKeyPress(.init(Character(UnicodeScalar(0xF705)!))) { editingID = task.id; return .handled }
-                .accessibilityLabel(task.title)
-                .accessibilityAction(named: Text("Edit task")) { editingID = task.id }
+                restingTitle
             }
         }
         .font(.system(size: 16))
         .frame(maxWidth: editingID == task.id ? .infinity : nil, alignment: .leading)
+    }
+
+    private var restingTitle: some View {
+        TaskTitleLabel(task: task, palette: palette, allowsWrap: allowsWrap)
+            .padding(.vertical, 12).frame(minHeight: 44, alignment: .leading)
+            .background(focusedTask.wrappedValue == task.id && !dragging ? palette.taskCheckboxBorder : .clear,
+                        in: RoundedRectangle(cornerRadius: 8))
+            .contentShape(Rectangle())
+            .simultaneousGesture(DragGesture(minimumDistance: 5, coordinateSpace: .named("task-drag-surface"))
+                .onChanged(dragChanged).onEnded(dragEnded), including: task.completedOn == nil ? .all : .none)
+        .focusable().focusEffectDisabled().focused(focusedTask, equals: task.id)
+        .onKeyPress(keys: [.space, .return, .leftArrow, .rightArrow, .upArrow, .downArrow, .escape], phases: .down, action: keyHandler)
+        .onTapGesture(count: 2) { editingID = task.id }
+        .onKeyPress(.init(Character(UnicodeScalar(0xF705)!))) { editingID = task.id; return .handled }
+        .accessibilityLabel("Move \(task.title)")
+        .accessibilityAddTraits(.isButton)
+        .accessibilityValue(dragging ? "Picked up" : "")
+        .accessibilityHint(task.completedOn == nil
+            ? "Double-click or press F2 to edit. Press Space to pick up, arrow keys to choose a stage, then Space to drop. Escape cancels."
+            : "Double-click or press F2 to edit.")
+        .help(task.title)
+        .onContinuousHover(perform: showCursor)
+        .accessibilityAction { activate() }
+        .accessibilityAction(named: Text("Edit task")) { editingID = task.id }
+    }
+
+    private func showCursor(_ phase: HoverPhase) {
+        guard task.completedOn == nil, NSEvent.pressedMouseButtons == 0 else { return }
+        switch phase {
+        case .active: NSCursor.openHand.set()
+        case .ended: NSCursor.arrow.set()
+        }
     }
 
     private func finish(save: Bool, restoreFocus: Bool = true, removeEmpty: Bool = false) {
@@ -925,30 +1327,57 @@ private struct DaymarkSectionPositions: PreferenceKey {
     }
 }
 
-private struct BoardScrollResolver: NSViewRepresentable {
-    let resolved: (NSScrollView) -> Void
-    let scrolled: (CGFloat) -> Void
+struct BoardScrollResolver: NSViewRepresentable {
+    var resolved: ((NSScrollView) -> Void)?
+    var scrolled: ((CGFloat) -> Void)?
 
     final class Locator: NSView {
         var resolve: ((NSScrollView) -> Void)?
         var onScroll: ((CGFloat) -> Void)?
-        weak var clip: NSClipView?
         var listener: NSObjectProtocol?
-        deinit { if let listener { NotificationCenter.default.removeObserver(listener) } }
+        private var wheelMonitor: Any?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let wheelMonitor { NSEvent.removeMonitor(wheelMonitor); self.wheelMonitor = nil }
+            guard window != nil else { return }
+            wheelMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                // Trackpad gestures can begin or end with a phase change and no movement.
+                let phaseOnly = event.scrollingDeltaX == 0 && event.scrollingDeltaY == 0
+                    && (!event.phase.isEmpty || !event.momentumPhase.isEmpty)
+                guard let self, let window = self.window, event.window === window,
+                      event.modifierFlags.intersection([.control, .shift]).isEmpty,
+                      phaseOnly || abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX),
+                      let scroll = self.enclosingScrollView, let content = window.contentView
+                else { return event }
+                // Pinned headings overlap the scroll view but live outside its responder chain.
+                let point = content.superview?.convert(event.locationInWindow, from: nil) ?? event.locationInWindow
+                if let hit = content.hitTest(point), hit === scroll || hit.isDescendant(of: scroll) {
+                    return event
+                }
+                scroll.scrollWheel(with: event)
+                return nil
+            }
+        }
+
+        deinit {
+            if let listener { NotificationCenter.default.removeObserver(listener) }
+            if let wheelMonitor { NSEvent.removeMonitor(wheelMonitor) }
+        }
 
         override func viewDidMoveToSuperview() {
             super.viewDidMoveToSuperview()
             DispatchQueue.main.async { [weak self] in
                 guard let self, let scrollView = self.enclosingScrollView else { return }
+                self.resolve?(scrollView)
+                guard self.onScroll != nil else { return }
                 let clip = scrollView.contentView
                 if let listener { NotificationCenter.default.removeObserver(listener) }
-                self.clip = clip
                 clip.postsBoundsChangedNotifications = true
                 self.listener = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self, weak clip] _ in
                     guard let clip else { return }
                     self?.onScroll?(clip.bounds.minY)
                 }
-                self.resolve?(scrollView)
                 self.onScroll?(clip.bounds.minY)
             }
         }
@@ -966,8 +1395,3 @@ private struct BoardScrollResolver: NSViewRepresentable {
 }
 
 private final class WeakBoardScrollView { weak var value: NSScrollView? }
-private enum ComposerMenu { case block, stage }
-
-private extension UTType {
-    static let daymarkTask = UTType(exportedAs: "com.nicovanzyl.daymark.task")
-}

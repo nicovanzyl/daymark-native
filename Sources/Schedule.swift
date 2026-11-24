@@ -15,7 +15,7 @@ struct FocusBlock: Codable, Equatable, Identifiable {
 }
 
 struct Settings: Codable, Equatable {
-    var labels = ["Research", "Marketing", "Prototyping"]
+    var labels = ["", "", ""]
     var shares = [1.0, 1.0, 1.0]
     var work = Array(repeating: [WorkWindow(start: 540, end: 1020)], count: 5) + [[], []]
     var onboardingComplete = false
@@ -41,14 +41,12 @@ enum Schedule {
 
     static func clock(_ minute: Int) -> String { String(format: "%02d:%02d", minute / 60, minute % 60) }
 
-    static func minute(_ text: String) -> Int? {
-        let parts = text.trimmingCharacters(in: .whitespaces).split(separator: ":", omittingEmptySubsequences: false)
-        guard parts.count == 2, parts[1].count == 2, parts[0].count <= 2,
-              let hour = Int(parts[0]), let minute = Int(parts[1]),
-              hour >= 0, hour <= 24, minute >= 0, minute < 60,
-              hour != 24 || minute == 0
-        else { return nil }
-        return hour * 60 + minute
+    static func remapped(_ allowed: [Int]?, coloursFrom previous: [Int?]) -> [Int]? {
+        guard let allowed, !allowed.isEmpty else { return nil }
+        let surviving = previous.indices.filter { index in
+            previous[index].map(allowed.contains) ?? false
+        }
+        return surviving.isEmpty || surviving.count == previous.count ? nil : surviving
     }
 
     static func valid(_ week: [[WorkWindow]], count: Int) -> [[WorkWindow]]? {
