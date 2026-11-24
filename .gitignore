@@ -1,0 +1,20 @@
+# Local builds, captures, and previous bundles
+*.app/
+*.dSYM/
+.build/
+DerivedData/
+build/
+*.png
+.previous.*/
+.replacement.*/
+
+# Local workspaces and environment configuration
+workspace.json
+workspace-*.json
+.env
+.env.*
+*.xcuserstate
+xcuserdata/
+
+# Finder
+.DS_Store
